@@ -82,7 +82,10 @@ pub struct Session<T: InvokeUiSession> {
     #[cfg(feature = "flutter")]
     pub cursor_shapes: Arc<RwLock<HashMap<u64, CursorData>>>,
     // One in-flight semantic action. The next send waits for its peer result.
+    // tap_norm uses this same slot.
     pub semantic_flight: Arc<Mutex<crate::semantic_action::Flight>>,
+    // Contain frame last published by the view. tap_norm reads it at call time.
+    pub viewport_frame: Arc<Mutex<Option<crate::tap_norm::ViewportFrame>>>,
 }
 
 #[derive(Clone)]
@@ -967,6 +970,78 @@ impl<T: InvokeUiSession> Session<T> {
         crate::semantic_action::OK.to_owned()
     }
 
+    pub fn note_viewport_frame(
+        &self,
+        present: bool,
+        w: f64,
+        h: f64,
+        scale: f64,
+        ox: f64,
+        oy: f64,
+    ) {
+        let mut slot = self.viewport_frame.lock().unwrap();
+        if !present {
+            *slot = None;
+            return;
+        }
+        *slot = Some(crate::tap_norm::ViewportFrame {
+            w,
+            h,
+            scale,
+            offset_x: ox,
+            offset_y: oy,
+        });
+    }
+
+    /// Enqueue one content-normalized tap. `ok` means the message was queued.
+    /// Read [`Self::tap_result`] and treat only that function's `ok` as done.
+    /// The call shares [`Self::semantic_flight`] with semantic actions.
+    pub fn tap_norm(&self, x: f64, y: f64) -> String {
+        let (remote_desktop, view_only, platform) = {
+            let lc = self.lc.read().unwrap();
+            (
+                lc.conn_type == ConnType::DEFAULT_CONN,
+                lc.view_only.v,
+                lc.info.platform.clone(),
+            )
+        };
+        let input_allowed = !view_only && *self.server_keyboard_enabled.read().unwrap();
+        let sender_guard = self.sender.read().unwrap();
+        let admitted = crate::tap_norm::admit_latest(
+            &crate::tap_norm::Gate {
+                has_sender: sender_guard.is_some(),
+                remote_desktop,
+                input_allowed,
+                platform: &platform,
+            },
+            &self.viewport_frame,
+            x,
+            y,
+        );
+        let (px, py) = {
+            let mut flight = self.semantic_flight.lock().unwrap();
+            match crate::tap_norm::begin_tap(&mut flight, admitted) {
+                Ok(point) => point,
+                Err(code) => return code.to_owned(),
+            }
+        };
+        let Some(sender) = sender_guard.as_ref() else {
+            self.semantic_flight.lock().unwrap().abort();
+            return crate::semantic_action::NO_SESSION.to_owned();
+        };
+        let msg = crate::tap_norm::tap_message(px, py);
+        if sender.send(Data::Message(msg)).is_err() {
+            drop(sender_guard);
+            self.semantic_flight.lock().unwrap().abort();
+            return crate::semantic_action::INJECT_FAILED.to_owned();
+        }
+        crate::semantic_action::OK.to_owned()
+    }
+
+    pub fn tap_result(&self) -> String {
+        self.semantic_flight.lock().unwrap().result().to_owned()
+    }
+
     pub fn semantic_result(&self) -> String {
         self.semantic_flight.lock().unwrap().result().to_owned()
     }
@@ -978,6 +1053,12 @@ impl<T: InvokeUiSession> Session<T> {
         let mut flight = self.semantic_flight.lock().unwrap();
         flight.finish(code);
         log::debug!("semantic action peer result {}", flight.result());
+    }
+
+    pub fn note_tap_result(&self, code: &str) {
+        let mut flight = self.semantic_flight.lock().unwrap();
+        flight.finish_known(crate::tap_norm::normalize_peer_code(code));
+        log::debug!("norm tap peer result {}", flight.result());
     }
 
     #[cfg(any(target_os = "ios"))]

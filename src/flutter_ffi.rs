@@ -734,6 +734,47 @@ pub fn session_semantic_result(session_id: SessionID) -> SyncReturn<String> {
     SyncReturn(code)
 }
 
+/// Publish the view's current contain frame. `present` false clears it.
+/// `tap_norm` reads this slot at call time, after a resize or rotation.
+pub fn session_note_viewport_frame(
+    session_id: SessionID,
+    present: bool,
+    w: f64,
+    h: f64,
+    scale: f64,
+    offset_x: f64,
+    offset_y: f64,
+) -> SyncReturn<()> {
+    if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.note_viewport_frame(present, w, h, scale, offset_x, offset_y);
+    }
+    SyncReturn(())
+}
+
+/// Enqueue one tap at content-normalized `(x, y)` in `[0, 1]`. `ok` means queued.
+/// A letterbox or other point outside the contain rectangle returns `tap_miss`
+/// and is not sent. The call shares the semantic single-flight slot.
+/// Other codes: no_session, unsupported, inject_failed, `inject_failed: action in flight`.
+pub fn session_tap_norm(session_id: SessionID, x: f64, y: f64) -> SyncReturn<String> {
+    let code = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.tap_norm(x, y)
+    } else {
+        crate::semantic_action::NO_SESSION.to_owned()
+    };
+    SyncReturn(code)
+}
+
+/// Peer completion for [`session_tap_norm`]. `ok` here is success.
+/// The slot is the same one [`session_semantic_result`] reads.
+pub fn session_tap_result(session_id: SessionID) -> SyncReturn<String> {
+    let code = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.tap_result()
+    } else {
+        crate::semantic_action::NO_SESSION.to_owned()
+    };
+    SyncReturn(code)
+}
+
 // chat_client_mode
 pub fn session_send_chat(session_id: SessionID, text: String) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {

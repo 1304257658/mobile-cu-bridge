@@ -171,6 +171,13 @@ impl Flight {
         self.inflight = false;
     }
 
+    /// Store a code that is already a known result string.
+    /// `tap_norm` uses this so `tap_miss` is not rewritten by [`finish`].
+    pub fn finish_known(&mut self, code: &'static str) {
+        self.code = code.to_owned();
+        self.inflight = false;
+    }
+
     pub fn result(&self) -> &str {
         require_peer_result(&self.code)
     }

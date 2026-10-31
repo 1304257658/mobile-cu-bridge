@@ -2578,6 +2578,9 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.handler
                         .note_semantic_result(&result.kind, &result.code);
                 }
+                Some(message::Union::TapNormResult(result)) => {
+                    self.handler.note_tap_result(&result.code);
+                }
                 Some(message::Union::TerminalResponse(response)) => {
                     use base::message_proto::terminal_response::Union;
                     if let Some(Union::Opened(opened)) = &response.union {

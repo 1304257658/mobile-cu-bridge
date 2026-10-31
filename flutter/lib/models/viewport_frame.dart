@@ -73,3 +73,63 @@ ViewportFrame containFit({
     ),
   );
 }
+
+/// Remote content pixel for a normalized tap. Null is a miss.
+class NormTapPoint {
+  final int x;
+  final int y;
+
+  const NormTapPoint(this.x, this.y);
+}
+
+/// The point is outside the contain rectangle. It is not moved to the edge.
+const String tapMiss = 'tap_miss';
+
+bool _frameUsable(ViewportFrame frame) =>
+    _usable(frame.w) &&
+    _usable(frame.h) &&
+    _usable(frame.scale) &&
+    frame.offset.x.isFinite &&
+    frame.offset.y.isFinite;
+
+int? _contentPixel(double n, double size) {
+  if (!n.isFinite || n < 0 || n > 1 || !_usable(size)) return null;
+  final max = size.floor() - 1;
+  if (max < 0) return null;
+  final px = n >= 1 ? max : (n * size).floor();
+  if (px < 0 || px > max) return null;
+  return px;
+}
+
+/// [nx] and [ny] are relative to the contain content rectangle, not the window.
+/// A value outside `[0, 1]` is the letterbox and is a miss.
+NormTapPoint? mapNormTap(ViewportFrame frame, double nx, double ny) {
+  if (!_frameUsable(frame) || !nx.isFinite || !ny.isFinite) return null;
+  if (nx < 0 || nx > 1 || ny < 0 || ny > 1) return null;
+  final left = frame.offset.x;
+  final top = frame.offset.y;
+  final right = frame.offset.x + frame.w * frame.scale;
+  final bottom = frame.offset.y + frame.h * frame.scale;
+  final vx = frame.offset.x + nx * frame.w * frame.scale;
+  final vy = frame.offset.y + ny * frame.h * frame.scale;
+  if (!vx.isFinite ||
+      !vy.isFinite ||
+      vx < left ||
+      vx > right ||
+      vy < top ||
+      vy > bottom) {
+    return null;
+  }
+  final x = _contentPixel(nx, frame.w);
+  final y = _contentPixel(ny, frame.h);
+  if (x == null || y == null) return null;
+  return NormTapPoint(x, y);
+}
+
+/// A view point in pixels. The letterbox is outside the content rectangle.
+NormTapPoint? mapViewTap(ViewportFrame frame, double px, double py) {
+  if (!_frameUsable(frame) || !px.isFinite || !py.isFinite) return null;
+  final nx = (px - frame.offset.x) / (frame.w * frame.scale);
+  final ny = (py - frame.offset.y) / (frame.h * frame.scale);
+  return mapNormTap(frame, nx, ny);
+}

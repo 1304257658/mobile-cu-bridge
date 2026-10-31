@@ -1008,6 +1008,20 @@ message SemanticActionResult {
   string code = 2;
 }
 
+// A tap already mapped into remote content pixels (the contain frame's w/h,
+// the same space as MouseEvent). Not a semantic shortcut. The peer runs it
+// as one accessibility gesture. It does not replace sys.*, open_app, or set_text.
+message TapNorm {
+  int32 x = 1;
+  int32 y = 2;
+}
+
+// Peer result for a TapNorm. code is ok, unsupported, inject_failed, or tap_miss.
+// no_session is decided on the controller and is never sent by the peer.
+message TapNormResult {
+  string code = 1;
+}
+
 // One symmetric message for both directions. `open` only travels controller -> controlled,
 // `opened` only controlled -> controller; a frame in the wrong direction is ignored.
 message PortForwardChannel {
@@ -1057,5 +1071,7 @@ message Message {
     OSLogin os_login = 34;
     SemanticAction semantic_action = 35;
     SemanticActionResult semantic_action_result = 36;
+    TapNorm tap_norm = 37;
+    TapNormResult tap_norm_result = 38;
   }
 }
