@@ -66,6 +66,7 @@ mod updater;
 mod ui_cm_interface;
 mod ui_interface;
 mod ui_session_interface;
+mod semantic_action;
 
 mod hbbs_http;
 

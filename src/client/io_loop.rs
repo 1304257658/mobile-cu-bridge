@@ -2574,6 +2574,10 @@ impl<T: InvokeUiSession> Remote<T> {
                     self.handler
                         .handle_screenshot_resp(response.sid, response.msg);
                 }
+                Some(message::Union::SemanticActionResult(result)) => {
+                    self.handler
+                        .note_semantic_result(&result.kind, &result.code);
+                }
                 Some(message::Union::TerminalResponse(response)) => {
                     use base::message_proto::terminal_response::Union;
                     if let Some(Union::Opened(opened)) = &response.union {

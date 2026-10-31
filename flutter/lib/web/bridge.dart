@@ -543,6 +543,23 @@ class RustdeskImpl {
         () => js.context.callMethod('setByName', ['input_string', value]));
   }
 
+  // Native returns this from Rust. Web has no session executor in this repo,
+  // so the call is refused instead of being turned into a browser key or paste.
+  // `unsupported` is a failure. It is not an enqueue acknowledgement.
+  String sessionSemanticAction(
+      {required UuidValue sessionId,
+      required String kind,
+      required String arg,
+      dynamic hint}) {
+    return 'unsupported';
+  }
+
+  // No peer completion exists on web. This is a readable failure, not success.
+  String sessionSemanticResult(
+      {required UuidValue sessionId, dynamic hint}) {
+    return 'inject_failed: no peer result';
+  }
+
   Future<void> sessionSendChat(
       {required UuidValue sessionId, required String text, dynamic hint}) {
     return Future(

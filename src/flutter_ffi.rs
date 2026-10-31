@@ -706,6 +706,34 @@ pub fn session_input_string(session_id: SessionID, value: String) {
     }
 }
 
+/// Enqueue one semantic shortcut. `ok` means queued, not that the peer succeeded.
+/// `prepare_send` runs before the session message is built. A second call before
+/// [`session_semantic_result`] returns `inject_failed: action in flight` and is not sent.
+/// Other codes: no_session, unsupported, inject_failed.
+pub fn session_semantic_action(
+    session_id: SessionID,
+    kind: String,
+    arg: String,
+) -> SyncReturn<String> {
+    let code = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.semantic_action(&kind, &arg)
+    } else {
+        crate::semantic_action::NO_SESSION.to_owned()
+    };
+    SyncReturn(code)
+}
+
+/// Peer completion for [`session_semantic_action`]. `ok` here is success.
+/// No stored completion returns `inject_failed: no peer result`, not an empty string.
+pub fn session_semantic_result(session_id: SessionID) -> SyncReturn<String> {
+    let code = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.semantic_result()
+    } else {
+        crate::semantic_action::NO_SESSION.to_owned()
+    };
+    SyncReturn(code)
+}
+
 // chat_client_mode
 pub fn session_send_chat(session_id: SessionID, text: String) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {

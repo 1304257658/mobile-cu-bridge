@@ -990,6 +990,24 @@ message PortForwardWindowUpdate {
   uint32 add = 2;
 }
 
+// In-session semantic shortcut. The controlled peer runs it with a system API
+// (accessibility global action, package intent, or the focused field). It is
+// not a key event, a clipboard write, or a pointer event.
+message SemanticAction {
+  // sys.back | sys.home | sys.recents | open_app | ime | set_text
+  string kind = 1;
+  // open_app: package or package/activity. set_text: field text.
+  // ime: show | hide. Empty for the sys.* kinds.
+  string arg = 2;
+}
+
+// Peer result for a SemanticAction. code is ok, unsupported, or inject_failed.
+// no_session is decided on the controller and is never sent by the peer.
+message SemanticActionResult {
+  string kind = 1;
+  string code = 2;
+}
+
 // One symmetric message for both directions. `open` only travels controller -> controlled,
 // `opened` only controlled -> controller; a frame in the wrong direction is ignored.
 message PortForwardChannel {
@@ -1037,5 +1055,7 @@ message Message {
     PortForwardChannel port_forward_channel = 33;
     // Auto Login: the peer types the password only if it is at its logon or lock screen.
     OSLogin os_login = 34;
+    SemanticAction semantic_action = 35;
+    SemanticActionResult semantic_action_result = 36;
   }
 }

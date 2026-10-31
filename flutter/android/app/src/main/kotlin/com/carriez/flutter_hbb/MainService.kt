@@ -95,6 +95,12 @@ class MainService : Service() {
     }
 
     @Keep
+    fun rustSemanticAction(kind: String, arg: String): String {
+        val svc = InputService.ctx ?: return "inject_failed"
+        return svc.performSemanticAction(kind, arg)
+    }
+
+    @Keep
     fun rustGetByName(name: String): String {
         return when (name) {
             "screen_size" -> {

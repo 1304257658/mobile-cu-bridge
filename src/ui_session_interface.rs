@@ -81,6 +81,8 @@ pub struct Session<T: InvokeUiSession> {
     // peer sends a shape once, and a window asks for it whenever it has to draw it again.
     #[cfg(feature = "flutter")]
     pub cursor_shapes: Arc<RwLock<HashMap<u64, CursorData>>>,
+    // One in-flight semantic action. The next send waits for its peer result.
+    pub semantic_flight: Arc<Mutex<crate::semantic_action::Flight>>,
 }
 
 #[derive(Clone)]
@@ -917,6 +919,65 @@ impl<T: InvokeUiSession> Session<T> {
         let mut msg_out = Message::new();
         msg_out.set_key_event(key_event);
         self.send(Data::Message(msg_out));
+    }
+
+    /// Enqueue one semantic shortcut on this remote-desktop session.
+    ///
+    /// `ok` means the message was queued. It is not peer success. Read
+    /// [`Self::semantic_result`] and treat only that function's `ok` as done.
+    /// A second call before that result returns `inject_failed: action in flight`
+    /// and is not sent. A missing completion is `inject_failed: no peer result`.
+    pub fn semantic_action(&self, kind: &str, arg: &str) -> String {
+        let (remote_desktop, view_only, platform) = {
+            let lc = self.lc.read().unwrap();
+            (
+                lc.conn_type == ConnType::DEFAULT_CONN,
+                lc.view_only.v,
+                lc.info.platform.clone(),
+            )
+        };
+        let input_allowed = !view_only && *self.server_keyboard_enabled.read().unwrap();
+        let sender_guard = self.sender.read().unwrap();
+        let code = crate::semantic_action::gate(
+            &crate::semantic_action::Gate {
+                has_sender: sender_guard.is_some(),
+                remote_desktop,
+                input_allowed,
+                platform: &platform,
+            },
+            kind,
+            arg,
+        );
+        {
+            let mut flight = self.semantic_flight.lock().unwrap();
+            if let Err(err) = crate::semantic_action::prepare_send(&mut flight, code) {
+                return err.to_owned();
+            }
+        }
+        let Some(sender) = sender_guard.as_ref() else {
+            self.semantic_flight.lock().unwrap().abort();
+            return crate::semantic_action::NO_SESSION.to_owned();
+        };
+        let msg = crate::semantic_action::action_message(kind, arg);
+        if sender.send(Data::Message(msg)).is_err() {
+            drop(sender_guard);
+            self.semantic_flight.lock().unwrap().abort();
+            return crate::semantic_action::INJECT_FAILED.to_owned();
+        }
+        crate::semantic_action::OK.to_owned()
+    }
+
+    pub fn semantic_result(&self) -> String {
+        self.semantic_flight.lock().unwrap().result().to_owned()
+    }
+
+    pub fn note_semantic_result(&self, kind: &str, code: &str) {
+        if kind.len() > 32 {
+            log::error!("semantic result kind is {} bytes", kind.len());
+        }
+        let mut flight = self.semantic_flight.lock().unwrap();
+        flight.finish(code);
+        log::debug!("semantic action peer result {}", flight.result());
     }
 
     #[cfg(any(target_os = "ios"))]
