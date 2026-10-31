@@ -43,6 +43,7 @@ import '../utils/image.dart' as img;
 import '../common/widgets/dialog.dart';
 import 'input_model.dart';
 import 'platform_model.dart';
+import 'viewport_frame.dart';
 import 'package:flutter_hbb/utils/scale.dart';
 
 import 'package:flutter_hbb/generated_bridge.dart'
@@ -2291,6 +2292,9 @@ class CanvasModel with ChangeNotifier {
   double get x => _x;
   double get y => _y;
   double get scale => _scale;
+
+  // Android letterbox. Null for other peers and for an explicit custom scale.
+  ViewportFrame? get frame => _containFrame();
   bool get locked => _locked;
   double get devicePixelRatio => _devicePixelRatio;
   Size get size => _size;
@@ -2434,6 +2438,7 @@ class CanvasModel with ChangeNotifier {
       }
     }
     _resetCanvasOffset(displayWidth, displayHeight);
+    _applyContainFrame();
     final overflow = _x < 0 || y < 0;
     if (_imageOverflow.value != overflow) {
       _imageOverflow.value = overflow;
@@ -2453,6 +2458,41 @@ class CanvasModel with ChangeNotifier {
     if (isMobile) {
       _moveToCenterCursor();
     }
+  }
+
+  // Letterbox an Android session, including the desktop default `original`.
+  // Custom stays an explicit zoom. A fresh peer is stored as adaptive.
+  bool _usesContainFit() {
+    if (parent.target?.ffiModel.isPeerAndroid != true) return false;
+    return androidViewUsesContain(_lastViewStyle.style);
+  }
+
+  ViewportFrame? _containFrame() {
+    if (!_usesContainFit()) return null;
+    final displayWidth = getDisplayWidth();
+    final displayHeight = getDisplayHeight();
+    if (displayWidth <= 0 ||
+        displayHeight <= 0 ||
+        !size.width.isFinite ||
+        !size.height.isFinite ||
+        size.width <= 0 ||
+        size.height <= 0) {
+      return null;
+    }
+    return containFit(
+      contentW: displayWidth.toDouble(),
+      contentH: displayHeight.toDouble(),
+      viewW: size.width,
+      viewH: size.height,
+    );
+  }
+
+  void _applyContainFrame() {
+    final frame = _containFrame();
+    if (frame == null) return;
+    _scale = frame.scale;
+    _x = frame.offset.x;
+    _y = frame.offset.y;
   }
 
   tryUpdateScrollStyle(Duration duration, String? style) async {
@@ -2762,6 +2802,7 @@ class CanvasModel with ChangeNotifier {
       _scale = 1.0 / _devicePixelRatio;
     }
     _resetCanvasOffset(getDisplayWidth(), getDisplayHeight());
+    _applyContainFrame();
     bind.sessionSetViewStyle(sessionId: sessionId, value: _lastViewStyle.style);
     notifyListeners();
   }
@@ -2800,6 +2841,7 @@ class CanvasModel with ChangeNotifier {
         Timer(Duration(milliseconds: 100), () async {
       updateSize();
       _resetCanvasOffset(getDisplayWidth(), getDisplayHeight());
+      _applyContainFrame();
       notifyListeners();
     });
   }

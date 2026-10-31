@@ -2891,6 +2891,24 @@ impl Deref for LoginConfigHandler {
     }
 }
 
+/// Desktop defaults fill a new peer with `original`. An empty value is filled
+/// the same way on the next load, so a fresh Android peer is stored as
+/// `adaptive` the first time its platform is known. The view letterboxes
+/// `original` too; this only avoids rewriting a style already saved for a peer.
+fn android_initial_view_style(
+    stored_view_style: &str,
+    stored_platform: &str,
+    peer_platform: &str,
+) -> Option<&'static str> {
+    if !stored_platform.is_empty() || peer_platform != crate::PLATFORM_ANDROID {
+        return None;
+    }
+    if stored_view_style.is_empty() || stored_view_style == "original" {
+        return Some("adaptive");
+    }
+    None
+}
+
 impl LoginConfigHandler {
     pub(crate) fn set_hash(&mut self, hash: Hash) {
         self.hash = hash;
@@ -3666,6 +3684,13 @@ impl LoginConfigHandler {
             platform: pi.platform.clone(),
         };
         let mut config = self.load_config();
+        if let Some(style) = android_initial_view_style(
+            &config.view_style,
+            &config.info.platform,
+            &pi.platform,
+        ) {
+            config.view_style = style.to_owned();
+        }
         config.info = serde;
         let password = self.password.clone();
         let password0 = config.password.clone();
@@ -5907,5 +5932,38 @@ mod kx_tests {
         let (seen, decrypted) = handshake(KX_VERSION_LATEST, Some(0)).await;
         assert_eq!(seen.picked, 1);
         assert!(!seen.decrypted && !decrypted);
+    }
+}
+
+#[cfg(test)]
+mod android_view_style_tests {
+    use super::android_initial_view_style;
+
+    #[test]
+    fn fresh_android_peer_stores_adaptive_instead_of_desktop_original() {
+        assert_eq!(
+            android_initial_view_style("original", "", "Android"),
+            Some("adaptive")
+        );
+        assert_eq!(
+            android_initial_view_style("", "", "Android"),
+            Some("adaptive")
+        );
+    }
+
+    #[test]
+    fn fresh_non_android_peer_keeps_original() {
+        assert_eq!(android_initial_view_style("original", "", "Windows"), None);
+        assert_eq!(android_initial_view_style("original", "", "Linux"), None);
+    }
+
+    #[test]
+    fn known_android_peer_keeps_an_explicit_style() {
+        assert_eq!(
+            android_initial_view_style("original", "Android", "Android"),
+            None
+        );
+        assert_eq!(android_initial_view_style("custom", "", "Android"), None);
+        assert_eq!(android_initial_view_style("adaptive", "", "Android"), None);
     }
 }
