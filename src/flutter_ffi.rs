@@ -706,8 +706,10 @@ pub fn session_input_string(session_id: SessionID, value: String) {
     }
 }
 
-/// Enqueue a semantic shortcut. `ok` means queued, not that the peer succeeded.
-/// Wait for [`session_semantic_result`]. Codes: ok, no_session, unsupported, inject_failed.
+/// Enqueue one semantic shortcut. `ok` means queued, not that the peer succeeded.
+/// A second call before [`session_semantic_result`] returns
+/// `inject_failed: action in flight` and is not sent.
+/// Other codes: no_session, unsupported, inject_failed.
 pub fn session_semantic_action(
     session_id: SessionID,
     kind: String,

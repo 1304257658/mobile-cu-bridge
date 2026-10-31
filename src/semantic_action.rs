@@ -30,6 +30,10 @@ pub const INJECT_FAILED: &str = "inject_failed";
 /// `session_semantic_result` when the peer has not answered. Not success.
 pub const RESULT_MISSING: &str = "inject_failed: no peer result";
 
+/// Second `session_semantic_action` while the previous one has no peer result.
+/// The call is not sent.
+pub const IN_FLIGHT: &str = "inject_failed: action in flight";
+
 /// Bytes, not chars. Larger `set_text` payloads are refused before they are copied
 /// into a session message.
 pub const SET_TEXT_MAX: usize = 16 * 1024;
@@ -136,6 +140,40 @@ pub fn require_peer_result(stored: &str) -> &str {
 /// Pass the value from `session_semantic_result`, not the enqueue return.
 pub fn is_peer_success(result: &str) -> bool {
     result == OK
+}
+
+/// One semantic action at a time. The next `begin` waits until `finish`.
+#[derive(Default)]
+pub struct Flight {
+    inflight: bool,
+    code: String,
+}
+
+impl Flight {
+    /// Reserve the single slot. The previous completion is cleared.
+    pub fn begin(&mut self) -> Result<(), &'static str> {
+        if self.inflight {
+            return Err(IN_FLIGHT);
+        }
+        self.inflight = true;
+        self.code.clear();
+        Ok(())
+    }
+
+    /// The send did not happen. Another action may start.
+    pub fn abort(&mut self) {
+        self.inflight = false;
+    }
+
+    /// Peer completion. Another action may start.
+    pub fn finish(&mut self, code: &str) {
+        self.code = normalize_peer_code(code).to_owned();
+        self.inflight = false;
+    }
+
+    pub fn result(&self) -> &str {
+        require_peer_result(&self.code)
+    }
 }
 
 /// Peer codes are a closed set. Anything else is an injection failure, and an
@@ -356,6 +394,29 @@ mod tests {
         assert_eq!(require_peer_result(NO_SESSION), NO_SESSION);
         assert_eq!(require_peer_result(UNSUPPORTED), UNSUPPORTED);
         assert_eq!(require_peer_result(INJECT_FAILED), INJECT_FAILED);
+    }
+
+    #[test]
+    fn single_flight_rejects_a_second_action_until_the_peer_answers() {
+        let mut flight = Flight::default();
+        flight.begin().unwrap();
+        assert_eq!(flight.begin(), Err(IN_FLIGHT));
+        assert!(flight.inflight);
+        assert_eq!(flight.result(), RESULT_MISSING);
+        assert!(!is_peer_success(flight.result()));
+        assert!(!is_peer_success(IN_FLIGHT));
+        flight.finish(OK);
+        assert!(!flight.inflight);
+        assert!(is_peer_success(flight.result()));
+        flight.begin().unwrap();
+        assert_eq!(flight.result(), RESULT_MISSING);
+        assert_eq!(flight.begin(), Err(IN_FLIGHT));
+        flight.finish(INJECT_FAILED);
+        assert_eq!(flight.result(), INJECT_FAILED);
+        flight.begin().unwrap();
+        flight.abort();
+        assert!(!flight.inflight);
+        flight.begin().unwrap();
     }
 
     #[test]

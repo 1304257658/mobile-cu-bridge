@@ -35,5 +35,8 @@ void main() {
     expect(semanticPeerSuccess(semanticNoSession), isFalse);
     expect(semanticPeerSuccess(semanticUnsupported), isFalse);
     expect(semanticPeerSuccess(semanticInjectFailed), isFalse);
+    expect(semanticPeerSuccess(semanticInFlight), isFalse);
+    expect(semanticInFlight, isNot(semanticOk));
+    expect(semanticInFlight, isNot(semanticResultMissing));
   });
 }

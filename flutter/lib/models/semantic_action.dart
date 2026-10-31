@@ -29,6 +29,10 @@ const String semanticInjectFailed = 'inject_failed';
 /// `sessionSemanticResult` when the peer has not answered. Not success.
 const String semanticResultMissing = 'inject_failed: no peer result';
 
+/// Second `sessionSemanticAction` before the in-flight one has a peer result.
+/// The call is not sent.
+const String semanticInFlight = 'inject_failed: action in flight';
+
 /// True only when [peerResult] is the peer completion `ok`.
 ///
 /// Do not pass the return value of `sessionSemanticAction`. That `ok` means
