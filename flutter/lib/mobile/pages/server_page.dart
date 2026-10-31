@@ -14,6 +14,7 @@ import '../../consts.dart';
 import '../../models/platform_model.dart';
 import '../../models/server_model.dart';
 import '../../utils/android_documents.dart';
+import '../widgets/android_input_control.dart';
 import 'home_page.dart';
 
 class ServerPage extends StatefulWidget implements PageShape {
@@ -653,6 +654,13 @@ class _PermissionCheckerState extends State<PermissionChecker> {
             serverModel.inputOk,
             serverModel.toggleInput,
           ),
+          if (isAndroid)
+            AndroidInputControlHints(
+              inputEnabled: serverModel.inputOk,
+              launchFailed: serverModel.inputSettingsLaunchFailed,
+              manufacturer: androidManufacturer,
+              brand: androidBrand,
+            ),
           PermissionRow(
             translate("Transfer file"),
             serverModel.fileOk,

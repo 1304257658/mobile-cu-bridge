@@ -2,6 +2,7 @@ package com.carriez.flutter_hbb
 
 import android.Manifest.permission.*
 import android.annotation.SuppressLint
+import android.content.ComponentName
 import android.content.Context
 import android.content.Intent
 import android.media.AudioRecord
@@ -10,6 +11,7 @@ import android.media.MediaCodecList
 import android.media.MediaFormat
 import android.net.Uri
 import android.os.Build
+import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
 import android.os.PowerManager
@@ -94,18 +96,56 @@ fun requestPermission(context: Context, type: String) {
         }
 }
 
-fun startAction(context: Context, action: String) {
-    try {
-        context.startActivity(Intent(action).apply {
-            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            // don't pass package name when launch ACTION_ACCESSIBILITY_SETTINGS
-            if (ACTION_ACCESSIBILITY_SETTINGS != action) {
-                data = Uri.parse("package:" + context.packageName)
-            }
-        })
-    } catch (e: Exception) {
-        e.printStackTrace()
+fun startAction(context: Context, action: String): Boolean {
+    if (action == ACTION_ACCESSIBILITY_SETTINGS) {
+        return openInputAccessibilitySettings(context)
     }
+    return launchSettings(context, Intent(action).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        data = Uri.parse("package:" + context.packageName)
+    })
+}
+
+private const val ACCESSIBILITY_DETAILS_SETTINGS =
+    "android.settings.ACCESSIBILITY_DETAILS_SETTINGS"
+private const val FRAGMENT_ARG_KEY = ":settings:fragment_args_key"
+private const val SHOW_FRAGMENT_ARGUMENTS = ":settings:show_fragment_args"
+
+private fun openInputAccessibilitySettings(context: Context): Boolean {
+    val component = ComponentName(context, InputService::class.java).flattenToString()
+    fun highlight() = Bundle().apply { putString(FRAGMENT_ARG_KEY, component) }
+    val attempts = ArrayList<Intent>(3)
+    if (!isRestrictedSettingsOem() && Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+        attempts.add(Intent(ACCESSIBILITY_DETAILS_SETTINGS).apply {
+            addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            putExtra(Intent.EXTRA_COMPONENT_NAME, component)
+        })
+    }
+    attempts.add(Intent(ACTION_ACCESSIBILITY_SETTINGS).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+        putExtra(FRAGMENT_ARG_KEY, component)
+        putExtra(SHOW_FRAGMENT_ARGUMENTS, highlight())
+    })
+    attempts.add(Intent(ACTION_ACCESSIBILITY_SETTINGS).apply {
+        addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+    })
+    for (intent in attempts) {
+        if (launchSettings(context, intent)) return true
+    }
+    return false
+}
+
+private fun isRestrictedSettingsOem(): Boolean {
+    val value = "${Build.MANUFACTURER} ${Build.BRAND}".lowercase()
+    return listOf("oppo", "oneplus", "realme", "oplus", "coloros").any { value.contains(it) }
+}
+
+private fun launchSettings(context: Context, intent: Intent): Boolean = try {
+    context.startActivity(intent)
+    true
+} catch (e: Exception) {
+    e.printStackTrace()
+    false
 }
 
 class AudioReader(val bufSize: Int, private val maxFrames: Int) {

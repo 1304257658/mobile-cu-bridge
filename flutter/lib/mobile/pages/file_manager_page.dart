@@ -239,6 +239,7 @@ class _FileManagerPageState extends State<FileManagerPage> {
     }
     final appDir = PathUtil.join(home, appName, false);
     final paths = [
+      PathUtil.join(home, 'Logs', false),
       PathUtil.join(appDir, 'Logs', false),
       PathUtil.join(appDir, 'ScreenRecord', false),
     ].where((p) => File(p).existsSync() || Directory(p).existsSync()).toList();
