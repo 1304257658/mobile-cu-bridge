@@ -1,0 +1,68 @@
+import 'dart:math' as math;
+
+/// Origin of the fitted content inside the view, in view pixels.
+class ViewportOffset {
+  final double x;
+  final double y;
+
+  const ViewportOffset(this.x, this.y);
+}
+
+/// Remote frame placed in a view with a uniform contain (letterbox) fit.
+///
+/// [w] and [h] are the remote content size. [scale] maps that content onto
+/// the view, and [offset] is the content origin inside the view. A later
+/// normalized tap `(nx, ny)` on the fitted rectangle is `nx * w`, `ny * h`
+/// in remote pixels; a view point is outside the content when
+/// `(px - offset.x) / (w * scale)` is outside `[0, 1]` (same for y).
+class ViewportFrame {
+  final double w;
+  final double h;
+  final double scale;
+  final ViewportOffset offset;
+
+  const ViewportFrame({
+    required this.w,
+    required this.h,
+    required this.scale,
+    required this.offset,
+  });
+}
+
+bool _usable(double v) => v.isFinite && v > 0;
+
+/// Scale [contentW] x [contentH] uniformly so it fits inside the view.
+///
+/// The same scale is used on both axes, so the content is not stretched.
+/// Neither fitted axis exceeds the view, so the content is not cropped.
+/// Empty margins are split on the longer axis.
+ViewportFrame containFit({
+  required double contentW,
+  required double contentH,
+  required double viewW,
+  required double viewH,
+}) {
+  if (!_usable(contentW) ||
+      !_usable(contentH) ||
+      !_usable(viewW) ||
+      !_usable(viewH)) {
+    return ViewportFrame(
+      w: contentW,
+      h: contentH,
+      scale: 1,
+      offset: const ViewportOffset(0, 0),
+    );
+  }
+  final scale = math.min(viewW / contentW, viewH / contentH);
+  final fittedW = contentW * scale;
+  final fittedH = contentH * scale;
+  return ViewportFrame(
+    w: contentW,
+    h: contentH,
+    scale: scale,
+    offset: ViewportOffset(
+      math.max(0.0, (viewW - fittedW) / 2),
+      math.max(0.0, (viewH - fittedH) / 2),
+    ),
+  );
+}
