@@ -560,6 +560,31 @@ class RustdeskImpl {
     return 'inject_failed: no peer result';
   }
 
+  // Web has no contain-frame slot. The native controller stores the frame.
+  void sessionNoteViewportFrame(
+      {required UuidValue sessionId,
+      required bool present,
+      required double w,
+      required double h,
+      required double scale,
+      required double offsetX,
+      required double offsetY,
+      dynamic hint}) {}
+
+  // Web has no session gesture. A tap is not turned into a browser click.
+  String sessionTapNorm(
+      {required UuidValue sessionId,
+      required double x,
+      required double y,
+      dynamic hint}) {
+    return 'unsupported';
+  }
+
+  // No peer completion exists on web. This is a readable failure, not success.
+  String sessionTapResult({required UuidValue sessionId, dynamic hint}) {
+    return 'inject_failed: no peer result';
+  }
+
   Future<void> sessionSendChat(
       {required UuidValue sessionId, required String text, dynamic hint}) {
     return Future(

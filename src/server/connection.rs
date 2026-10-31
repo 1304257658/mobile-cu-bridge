@@ -4146,6 +4146,20 @@ impl Connection {
                         .await;
                     self.update_auto_disconnect_timer();
                 }
+                Some(message::Union::TapNorm(tap)) => {
+                    let code = if self.is_authed_view_camera_conn() {
+                        crate::semantic_action::UNSUPPORTED
+                    } else if !self.peer_keyboard_enabled() {
+                        crate::semantic_action::INJECT_FAILED
+                    } else {
+                        crate::tap_norm::execute_on_peer(tap.x, tap.y)
+                    };
+                    if code != crate::semantic_action::OK {
+                        log::warn!("norm tap -> {code}");
+                    }
+                    self.send(crate::tap_norm::result_message(code)).await;
+                    self.update_auto_disconnect_timer();
+                }
                 _ => {}
             }
         }
@@ -6219,6 +6233,8 @@ impl Connection {
             Some(message::Union::OsLogin(_)) => "os_login",
             Some(message::Union::SemanticAction(_)) => "semantic_action",
             Some(message::Union::SemanticActionResult(_)) => "semantic_action_result",
+            Some(message::Union::TapNorm(_)) => "tap_norm",
+            Some(message::Union::TapNormResult(_)) => "tap_norm_result",
             Some(message::Union::Misc(misc)) => Self::misc_message_family(misc),
             Some(_) => "message.other",
             None => "empty",

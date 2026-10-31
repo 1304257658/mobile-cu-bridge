@@ -2489,10 +2489,39 @@ class CanvasModel with ChangeNotifier {
 
   void _applyContainFrame() {
     final frame = _containFrame();
-    if (frame == null) return;
+    if (frame == null) {
+      _noteViewportFrame(null);
+      return;
+    }
     _scale = frame.scale;
     _x = frame.offset.x;
     _y = frame.offset.y;
+    _noteViewportFrame(frame);
+  }
+
+  void _noteViewportFrame(ViewportFrame? frame) {
+    if (parent.target?.ffiModel.isPeerAndroid != true) return;
+    if (frame == null) {
+      bind.sessionNoteViewportFrame(
+        sessionId: sessionId,
+        present: false,
+        w: 0,
+        h: 0,
+        scale: 0,
+        offsetX: 0,
+        offsetY: 0,
+      );
+      return;
+    }
+    bind.sessionNoteViewportFrame(
+      sessionId: sessionId,
+      present: true,
+      w: frame.w,
+      h: frame.h,
+      scale: frame.scale,
+      offsetX: frame.offset.x,
+      offsetY: frame.offset.y,
+    );
   }
 
   tryUpdateScrollStyle(Duration duration, String? style) async {

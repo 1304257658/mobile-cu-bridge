@@ -87,4 +87,53 @@ void main() {
       expect(emptyView.offset.y, 0);
     });
   });
+
+  group('norm tap', () {
+    ViewportFrame phoneInView() => containFit(
+          contentW: 1080,
+          contentH: 2400,
+          viewW: 800,
+          viewH: 600,
+        );
+
+    test('an interior content point is that remote pixel', () {
+      final frame = phoneInView();
+      final point = mapNormTap(frame, 0.5, 0.25);
+
+      expect(point, isNotNull);
+      expect(point!.x, 540);
+      expect(point.y, 600);
+      expect(mapNormTap(frame, 0, 0), const NormTapPoint(0, 0));
+      expect(mapNormTap(frame, 1, 1), const NormTapPoint(1079, 2399));
+      expect(mapViewTap(frame, 400, 150), const NormTapPoint(540, 600));
+      expect(mapViewTap(frame, 535, 150), const NormTapPoint(1079, 600));
+    });
+
+    test('a letterbox point is tap_miss and is not the content edge', () {
+      final frame = phoneInView();
+      final edge = mapNormTap(frame, 0, 0.25);
+
+      expect(edge, const NormTapPoint(0, 600));
+      expect(mapViewTap(frame, 0, 150), isNull);
+      expect(mapViewTap(frame, 536, 150), isNull);
+      expect(mapNormTap(frame, -0.001, 0.25), isNull);
+      expect(mapNormTap(frame, 1.001, 0.25), isNull);
+      expect(mapNormTap(frame, double.nan, 0.5), isNull);
+      expect(tapMiss, 'tap_miss');
+    });
+
+    test('a rotated frame maps the same norm to the new pixel', () {
+      final portrait = phoneInView();
+      expect(mapNormTap(portrait, 0.5, 0.25), const NormTapPoint(540, 600));
+
+      final landscape = containFit(
+        contentW: 2400,
+        contentH: 1080,
+        viewW: 800,
+        viewH: 600,
+      );
+      expect(mapNormTap(landscape, 0.5, 0.25), const NormTapPoint(1200, 270));
+      expect(mapViewTap(landscape, 100, 0), isNull);
+    });
+  });
 }

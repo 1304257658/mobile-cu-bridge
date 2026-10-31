@@ -790,6 +790,46 @@ class InputService : AccessibilityService() {
         }
     }
 
+    /**
+     * One tap in capture pixels (the same space as a mouse event). Outside the
+     * current screen is `tap_miss` and is not moved to the edge. This is not
+     * `sys.*`, `open_app`, or `set_text`.
+     */
+    fun performNormTap(x: Int, y: Int): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            return "unsupported"
+        }
+        return dispatchNormTap(x, y)
+    }
+
+    @RequiresApi(Build.VERSION_CODES.N)
+    private fun dispatchNormTap(x: Int, y: Int): String {
+        val width = SCREEN_INFO.width
+        val height = SCREEN_INFO.height
+        val scale = SCREEN_INFO.scale
+        if (width <= 0 || height <= 0 || scale <= 0) {
+            return "inject_failed"
+        }
+        if (x < 0 || y < 0 || x >= width || y >= height) {
+            return "tap_miss"
+        }
+        val path = Path()
+        path.moveTo((x * scale).toFloat(), (y * scale).toFloat())
+        var duration = ViewConfiguration.getTapTimeout().toLong()
+        if (duration <= 0L) {
+            duration = 1L
+        }
+        return try {
+            val stroke = GestureDescription.StrokeDescription(path, 0, duration)
+            val builder = GestureDescription.Builder()
+            builder.addStroke(stroke)
+            if (dispatchGesture(builder.build(), null, null)) "ok" else "inject_failed"
+        } catch (e: Exception) {
+            Log.e(logTag, "norm tap failed", e)
+            "inject_failed"
+        }
+    }
+
     private fun globalAction(action: Int): String {
         return if (performGlobalAction(action)) "ok" else "inject_failed"
     }

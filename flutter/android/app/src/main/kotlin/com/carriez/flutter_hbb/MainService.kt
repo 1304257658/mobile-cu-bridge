@@ -101,6 +101,12 @@ class MainService : Service() {
     }
 
     @Keep
+    fun rustNormTap(x: Int, y: Int): String {
+        val svc = InputService.ctx ?: return "inject_failed"
+        return svc.performNormTap(x, y)
+    }
+
+    @Keep
     fun rustGetByName(name: String): String {
         return when (name) {
             "screen_size" -> {
