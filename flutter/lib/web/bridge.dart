@@ -543,6 +543,21 @@ class RustdeskImpl {
         () => js.context.callMethod('setByName', ['input_string', value]));
   }
 
+  // Native returns this from Rust. Web has no session executor in this repo,
+  // so the call is refused instead of being turned into a browser key or paste.
+  String sessionSemanticAction(
+      {required UuidValue sessionId,
+      required String kind,
+      required String arg,
+      dynamic hint}) {
+    return 'unsupported';
+  }
+
+  String sessionSemanticResult(
+      {required UuidValue sessionId, dynamic hint}) {
+    return 'unsupported';
+  }
+
   Future<void> sessionSendChat(
       {required UuidValue sessionId, required String text, dynamic hint}) {
     return Future(

@@ -81,6 +81,8 @@ pub struct Session<T: InvokeUiSession> {
     // peer sends a shape once, and a window asks for it whenever it has to draw it again.
     #[cfg(feature = "flutter")]
     pub cursor_shapes: Arc<RwLock<HashMap<u64, CursorData>>>,
+    // Latest peer code for one semantic action. Replaced, never appended.
+    pub semantic_result: Arc<Mutex<String>>,
 }
 
 #[derive(Clone)]
@@ -917,6 +919,60 @@ impl<T: InvokeUiSession> Session<T> {
         let mut msg_out = Message::new();
         msg_out.set_key_event(key_event);
         self.send(Data::Message(msg_out));
+    }
+
+    /// Enqueue a semantic shortcut on this remote-desktop session.
+    ///
+    /// Returns `ok`, `no_session`, `unsupported`, or `inject_failed`. `ok` means
+    /// the message was queued, not that the peer has finished. The peer's code
+    /// replaces [`Self::semantic_result`]; a later call clears that slot.
+    pub fn semantic_action(&self, kind: &str, arg: &str) -> String {
+        let (remote_desktop, view_only, platform) = {
+            let lc = self.lc.read().unwrap();
+            (
+                lc.conn_type == ConnType::DEFAULT_CONN,
+                lc.view_only.v,
+                lc.info.platform.clone(),
+            )
+        };
+        let input_allowed = !view_only && *self.server_keyboard_enabled.read().unwrap();
+        let sender_guard = self.sender.read().unwrap();
+        let code = crate::semantic_action::gate(
+            &crate::semantic_action::Gate {
+                has_sender: sender_guard.is_some(),
+                remote_desktop,
+                input_allowed,
+                platform: &platform,
+            },
+            kind,
+            arg,
+        );
+        if code != crate::semantic_action::OK {
+            return code.to_owned();
+        }
+        let Some(sender) = sender_guard.as_ref() else {
+            return crate::semantic_action::NO_SESSION.to_owned();
+        };
+        let msg = crate::semantic_action::action_message(kind, arg);
+        if sender.send(Data::Message(msg)).is_err() {
+            return crate::semantic_action::INJECT_FAILED.to_owned();
+        }
+        drop(sender_guard);
+        *self.semantic_result.lock().unwrap() = String::new();
+        crate::semantic_action::OK.to_owned()
+    }
+
+    pub fn semantic_result(&self) -> String {
+        self.semantic_result.lock().unwrap().clone()
+    }
+
+    pub fn note_semantic_result(&self, kind: &str, code: &str) {
+        if kind.len() > 32 {
+            log::error!("semantic result kind is {} bytes", kind.len());
+        }
+        let code = crate::semantic_action::normalize_peer_code(code);
+        log::debug!("semantic action peer result {code}");
+        *self.semantic_result.lock().unwrap() = code.to_owned();
     }
 
     #[cfg(any(target_os = "ios"))]

@@ -8,7 +8,9 @@ package com.carriez.flutter_hbb
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.ComponentName
 import android.content.Intent
+import android.view.inputmethod.ExtractedTextRequest
 import android.graphics.Path
 import android.os.Build
 import android.os.Bundle
@@ -69,6 +71,9 @@ const val TOUCH_PAN_END = 6
 const val WHEEL_STEP = 120
 const val WHEEL_DURATION = 50L
 const val LONG_TAP_DELAY = 200L
+
+// Same cap as src/semantic_action.rs SET_TEXT_MAX. A larger field is refused.
+const val SEMANTIC_TEXT_MAX = 16 * 1024
 
 class InputService : AccessibilityService() {
 
@@ -767,6 +772,135 @@ class InputService : AccessibilityService() {
         return success
     }
 
+
+    /**
+     * Session semantic shortcut. System keys use global accessibility actions,
+     * open_app starts a launcher intent, and set_text / ime write the focused
+     * field. No pointer gesture and no clipboard write.
+     */
+    fun performSemanticAction(kind: String, arg: String): String {
+        return when (kind) {
+            "sys.back" -> globalAction(GLOBAL_ACTION_BACK)
+            "sys.home" -> globalAction(GLOBAL_ACTION_HOME)
+            "sys.recents" -> globalAction(GLOBAL_ACTION_RECENTS)
+            "open_app" -> openApp(arg)
+            "ime" -> setImeMode(arg)
+            "set_text" -> setFocusedText(arg)
+            else -> "unsupported"
+        }
+    }
+
+    private fun globalAction(action: Int): String {
+        return if (performGlobalAction(action)) "ok" else "inject_failed"
+    }
+
+    private fun setImeMode(arg: String): String {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.N) {
+            return "unsupported"
+        }
+        val mode = when (arg) {
+            "show" -> SHOW_MODE_AUTO
+            "hide" -> SHOW_MODE_HIDDEN
+            else -> return "unsupported"
+        }
+        val controller = softKeyboardController
+        if (controller.showMode == mode) {
+            return "ok"
+        }
+        return if (controller.setShowMode(mode)) "ok" else "inject_failed"
+    }
+
+    private fun openApp(spec: String): String {
+        val slash = spec.indexOf('/')
+        val pkg = if (slash < 0) spec else spec.substring(0, slash)
+        if (pkg.isEmpty()) {
+            return "unsupported"
+        }
+        val intent = if (slash < 0) {
+            packageManager.getLaunchIntentForPackage(pkg)?.apply {
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            } ?: return "inject_failed"
+        } else {
+            val activity = spec.substring(slash + 1)
+            if (activity.isEmpty()) {
+                return "unsupported"
+            }
+            val cls = if (activity.startsWith(".")) pkg + activity else activity
+            Intent(Intent.ACTION_MAIN).apply {
+                addCategory(Intent.CATEGORY_LAUNCHER)
+                component = ComponentName(pkg, cls)
+                addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            }
+        }
+        return try {
+            startActivity(intent)
+            "ok"
+        } catch (e: RuntimeException) {
+            Log.e(logTag, "open_app $pkg failed", e)
+            "inject_failed"
+        }
+    }
+
+    private fun setFocusedText(text: String): String {
+        if (text.length > SEMANTIC_TEXT_MAX) {
+            Log.e(logTag, "set_text refused: ${text.length} chars")
+            return "unsupported"
+        }
+        setTextViaInputConnection(text)?.let { return it }
+        val focus = findFocus(AccessibilityNodeInfo.FOCUS_INPUT)
+        val editable = when {
+            focus == null -> null
+            focus.isEditable -> focus
+            else -> findChildNode(focus)
+        }
+        if (editable == null) {
+            if (focus != null && Build.VERSION.SDK_INT < 33) {
+                focus.recycle()
+            }
+            return "inject_failed"
+        }
+        val args = Bundle()
+        args.putCharSequence(
+            AccessibilityNodeInfo.ACTION_ARGUMENT_SET_TEXT_CHARSEQUENCE,
+            text
+        )
+        val ok = editable.performAction(AccessibilityNodeInfo.ACTION_SET_TEXT, args)
+        if (Build.VERSION.SDK_INT < 33) {
+            if (editable !== focus) {
+                editable.recycle()
+            }
+            focus?.recycle()
+        }
+        return if (ok) "ok" else "inject_failed"
+    }
+
+    private fun setTextViaInputConnection(text: String): String? {
+        if (Build.VERSION.SDK_INT < 33) {
+            return null
+        }
+        val ic = getInputMethod()?.currentInputConnection ?: return null
+        return try {
+            val req = ExtractedTextRequest()
+            req.hintMaxChars = SEMANTIC_TEXT_MAX
+            val extracted = ic.getExtractedText(req, 0) ?: return null
+            val existing = extracted.text?.length ?: 0
+            if (existing >= SEMANTIC_TEXT_MAX) {
+                Log.e(logTag, "set_text refused: focused field is at least $SEMANTIC_TEXT_MAX chars")
+                return "inject_failed"
+            }
+            ic.beginBatchEdit()
+            val committed = try {
+                ic.setSelection(0, existing)
+                ic.commitText(text, 1)
+            } finally {
+                ic.endBatchEdit()
+            }
+            if (committed) "ok" else "inject_failed"
+        } catch (e: RuntimeException) {
+            Log.e(logTag, "set_text input connection failed", e)
+            "inject_failed"
+        }
+    }
 
     override fun onAccessibilityEvent(event: AccessibilityEvent) {
     }

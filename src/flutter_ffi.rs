@@ -706,6 +706,30 @@ pub fn session_input_string(session_id: SessionID, value: String) {
     }
 }
 
+/// Semantic shortcut on the remote session. Codes: ok, no_session, unsupported, inject_failed.
+pub fn session_semantic_action(
+    session_id: SessionID,
+    kind: String,
+    arg: String,
+) -> SyncReturn<String> {
+    let code = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.semantic_action(&kind, &arg)
+    } else {
+        crate::semantic_action::NO_SESSION.to_owned()
+    };
+    SyncReturn(code)
+}
+
+/// Latest peer code for [`session_semantic_action`]. Empty until the peer answers.
+pub fn session_semantic_result(session_id: SessionID) -> SyncReturn<String> {
+    let code = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.semantic_result()
+    } else {
+        crate::semantic_action::NO_SESSION.to_owned()
+    };
+    SyncReturn(code)
+}
+
 // chat_client_mode
 pub fn session_send_chat(session_id: SessionID, text: String) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {

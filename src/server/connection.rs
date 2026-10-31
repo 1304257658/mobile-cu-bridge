@@ -4131,6 +4131,21 @@ impl Connection {
                     #[cfg(any(target_os = "android", target_os = "ios"))]
                     log::warn!("Terminal action received but not supported on this platform");
                 }
+                Some(message::Union::SemanticAction(action)) => {
+                    let code = if self.is_authed_view_camera_conn() {
+                        crate::semantic_action::UNSUPPORTED
+                    } else if !self.peer_keyboard_enabled() {
+                        crate::semantic_action::INJECT_FAILED
+                    } else {
+                        crate::semantic_action::execute_on_peer(&action.kind, &action.arg)
+                    };
+                    if code != crate::semantic_action::OK {
+                        log::warn!("semantic action {} -> {code}", action.kind);
+                    }
+                    self.send(crate::semantic_action::result_message(&action.kind, code))
+                        .await;
+                    self.update_auto_disconnect_timer();
+                }
                 _ => {}
             }
         }
@@ -6202,6 +6217,8 @@ impl Connection {
             Some(message::Union::TerminalResponse(_)) => "terminal_response",
             Some(message::Union::PortForwardChannel(_)) => "port_forward_channel",
             Some(message::Union::OsLogin(_)) => "os_login",
+            Some(message::Union::SemanticAction(_)) => "semantic_action",
+            Some(message::Union::SemanticActionResult(_)) => "semantic_action_result",
             Some(message::Union::Misc(misc)) => Self::misc_message_family(misc),
             Some(_) => "message.other",
             None => "empty",
