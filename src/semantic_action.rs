@@ -176,6 +176,17 @@ impl Flight {
     }
 }
 
+/// Client decision used by `session_semantic_action` before any message is sent.
+///
+/// `Ok` means this call may send one `SemanticAction`. `Err` means send nothing.
+/// A second `Ok` admission while a result is outstanding is [`IN_FLIGHT`].
+pub fn prepare_send(flight: &mut Flight, admitted: &'static str) -> Result<(), &'static str> {
+    if admitted != OK {
+        return Err(admitted);
+    }
+    flight.begin()
+}
+
 /// Peer codes are a closed set. Anything else is an injection failure, and an
 /// overlong code is not copied into the result slot.
 pub fn normalize_peer_code(code: &str) -> &'static str {
@@ -397,26 +408,35 @@ mod tests {
     }
 
     #[test]
-    fn single_flight_rejects_a_second_action_until_the_peer_answers() {
+    fn client_does_not_send_until_the_peer_result_arrives() {
         let mut flight = Flight::default();
-        flight.begin().unwrap();
-        assert_eq!(flight.begin(), Err(IN_FLIGHT));
-        assert!(flight.inflight);
+        let mut sent = Vec::new();
+
+        prepare_send(&mut flight, OK).unwrap();
+        sent.push(action_message(SYS_BACK, ""));
+        assert_eq!(sent.len(), 1);
         assert_eq!(flight.result(), RESULT_MISSING);
         assert!(!is_peer_success(flight.result()));
-        assert!(!is_peer_success(IN_FLIGHT));
-        flight.finish(OK);
-        assert!(!flight.inflight);
-        assert!(is_peer_success(flight.result()));
-        flight.begin().unwrap();
+
+        assert_eq!(prepare_send(&mut flight, OK), Err(IN_FLIGHT));
+        assert_eq!(sent.len(), 1);
         assert_eq!(flight.result(), RESULT_MISSING);
-        assert_eq!(flight.begin(), Err(IN_FLIGHT));
-        flight.finish(INJECT_FAILED);
-        assert_eq!(flight.result(), INJECT_FAILED);
-        flight.begin().unwrap();
+
+        assert_eq!(prepare_send(&mut flight, NO_SESSION), Err(NO_SESSION));
+        assert_eq!(sent.len(), 1);
+
+        flight.finish("ok");
+        assert!(is_peer_success(flight.result()));
+        prepare_send(&mut flight, OK).unwrap();
+        sent.push(action_message(SYS_HOME, ""));
+        assert_eq!(sent.len(), 2);
+        assert_eq!(flight.result(), RESULT_MISSING);
+        assert!(!is_peer_success(flight.result()));
+
         flight.abort();
-        assert!(!flight.inflight);
-        flight.begin().unwrap();
+        prepare_send(&mut flight, OK).unwrap();
+        sent.push(action_message(SYS_RECENTS, ""));
+        assert_eq!(sent.len(), 3);
     }
 
     #[test]

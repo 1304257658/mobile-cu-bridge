@@ -948,12 +948,9 @@ impl<T: InvokeUiSession> Session<T> {
             kind,
             arg,
         );
-        if code != crate::semantic_action::OK {
-            return code.to_owned();
-        }
         {
             let mut flight = self.semantic_flight.lock().unwrap();
-            if let Err(err) = flight.begin() {
+            if let Err(err) = crate::semantic_action::prepare_send(&mut flight, code) {
                 return err.to_owned();
             }
         }
