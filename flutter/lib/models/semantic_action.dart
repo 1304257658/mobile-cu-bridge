@@ -19,10 +19,29 @@ const List<String> semanticKinds = <String>[
   semanticSetText,
 ];
 
+/// Enqueue acknowledgement from `sessionSemanticAction`, and the peer
+/// completion from `sessionSemanticResult`. Enqueue `ok` is not success.
 const String semanticOk = 'ok';
 const String semanticNoSession = 'no_session';
 const String semanticUnsupported = 'unsupported';
 const String semanticInjectFailed = 'inject_failed';
+
+/// `sessionSemanticResult` when the peer has not answered. Not success.
+const String semanticResultMissing = 'inject_failed: no peer result';
+
+/// True only when [peerResult] is the peer completion `ok`.
+///
+/// Do not pass the return value of `sessionSemanticAction`. That `ok` means
+/// the message was queued.
+bool semanticPeerSuccess(String peerResult) => peerResult == semanticOk;
+
+/// Empty or missing completion is a readable failure, not success.
+String semanticCompletion(String? peerResult) {
+  if (peerResult == null || peerResult.trim().isEmpty) {
+    return semanticResultMissing;
+  }
+  return peerResult;
+}
 
 /// `ime` argument. `show` lets the soft keyboard appear for a focused field.
 /// `hide` suppresses it. Neither taps the keyboard.

@@ -706,7 +706,8 @@ pub fn session_input_string(session_id: SessionID, value: String) {
     }
 }
 
-/// Semantic shortcut on the remote session. Codes: ok, no_session, unsupported, inject_failed.
+/// Enqueue a semantic shortcut. `ok` means queued, not that the peer succeeded.
+/// Wait for [`session_semantic_result`]. Codes: ok, no_session, unsupported, inject_failed.
 pub fn session_semantic_action(
     session_id: SessionID,
     kind: String,
@@ -720,7 +721,8 @@ pub fn session_semantic_action(
     SyncReturn(code)
 }
 
-/// Latest peer code for [`session_semantic_action`]. Empty until the peer answers.
+/// Peer completion for [`session_semantic_action`]. `ok` here is success.
+/// No stored completion returns `inject_failed: no peer result`, not an empty string.
 pub fn session_semantic_result(session_id: SessionID) -> SyncReturn<String> {
     let code = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.semantic_result()

@@ -923,9 +923,9 @@ impl<T: InvokeUiSession> Session<T> {
 
     /// Enqueue a semantic shortcut on this remote-desktop session.
     ///
-    /// Returns `ok`, `no_session`, `unsupported`, or `inject_failed`. `ok` means
-    /// the message was queued, not that the peer has finished. The peer's code
-    /// replaces [`Self::semantic_result`]; a later call clears that slot.
+    /// `ok` means the message was queued. It is not peer success. Read
+    /// [`Self::semantic_result`] and treat only that function's `ok` as done.
+    /// A missing completion is `inject_failed: no peer result`.
     pub fn semantic_action(&self, kind: &str, arg: &str) -> String {
         let (remote_desktop, view_only, platform) = {
             let lc = self.lc.read().unwrap();
@@ -963,7 +963,8 @@ impl<T: InvokeUiSession> Session<T> {
     }
 
     pub fn semantic_result(&self) -> String {
-        self.semantic_result.lock().unwrap().clone()
+        let stored = self.semantic_result.lock().unwrap();
+        crate::semantic_action::require_peer_result(&stored).to_owned()
     }
 
     pub fn note_semantic_result(&self, kind: &str, code: &str) {

@@ -18,10 +18,17 @@ pub const SET_TEXT: &str = "set_text";
 
 pub const KINDS: [&str; 6] = [SYS_BACK, SYS_HOME, SYS_RECENTS, OPEN_APP, IME, SET_TEXT];
 
+/// Enqueue acknowledgement from `session_semantic_action`, and the peer
+/// completion code from `session_semantic_result`. The enqueue value is not
+/// peer success. Success is only this string when `session_semantic_result`
+/// returns it.
 pub const OK: &str = "ok";
 pub const NO_SESSION: &str = "no_session";
 pub const UNSUPPORTED: &str = "unsupported";
 pub const INJECT_FAILED: &str = "inject_failed";
+
+/// `session_semantic_result` when the peer has not answered. Not success.
+pub const RESULT_MISSING: &str = "inject_failed: no peer result";
 
 /// Bytes, not chars. Larger `set_text` payloads are refused before they are copied
 /// into a session message.
@@ -109,6 +116,26 @@ pub fn result_message(kind: &str, code: &str) -> Message {
         ..Default::default()
     });
     msg
+}
+
+/// Stored completion, or [`RESULT_MISSING`] when the slot is empty.
+///
+/// An empty string is not success. Callers wait until this is `ok`,
+/// `unsupported`, or `inject_failed`.
+pub fn require_peer_result(stored: &str) -> &str {
+    if stored.trim().is_empty() {
+        RESULT_MISSING
+    } else {
+        stored
+    }
+}
+
+/// True only for a peer completion of `ok`.
+///
+/// [`OK`] from `session_semantic_action` is the enqueue acknowledgement.
+/// Pass the value from `session_semantic_result`, not the enqueue return.
+pub fn is_peer_success(result: &str) -> bool {
+    result == OK
 }
 
 /// Peer codes are a closed set. Anything else is an injection failure, and an
@@ -308,6 +335,27 @@ mod tests {
         assert_eq!(execute_on_peer("pixel", ""), UNSUPPORTED);
         #[cfg(not(target_os = "android"))]
         assert_eq!(execute_on_peer(SYS_HOME, ""), UNSUPPORTED);
+    }
+
+    #[test]
+    fn enqueue_ok_waits_for_a_peer_result() {
+        let ready = desktop("Android");
+        assert_eq!(gate(&ready, SYS_BACK, ""), OK);
+        let waiting = require_peer_result("");
+        assert_eq!(waiting, RESULT_MISSING);
+        assert_ne!(waiting, OK);
+        assert!(!waiting.is_empty());
+        assert!(waiting.contains(INJECT_FAILED));
+        assert!(!is_peer_success(waiting));
+        assert!(!is_peer_success(""));
+        assert!(!is_peer_success(require_peer_result("   ")));
+        assert!(is_peer_success(require_peer_result(OK)));
+        assert!(!is_peer_success(require_peer_result(NO_SESSION)));
+        assert!(!is_peer_success(require_peer_result(UNSUPPORTED)));
+        assert!(!is_peer_success(require_peer_result(INJECT_FAILED)));
+        assert_eq!(require_peer_result(NO_SESSION), NO_SESSION);
+        assert_eq!(require_peer_result(UNSUPPORTED), UNSUPPORTED);
+        assert_eq!(require_peer_result(INJECT_FAILED), INJECT_FAILED);
     }
 
     #[test]

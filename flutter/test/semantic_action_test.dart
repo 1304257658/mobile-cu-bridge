@@ -14,13 +14,26 @@ void main() {
     expect(semanticKinds.toSet().length, semanticKinds.length);
   });
 
-  test('failure codes are distinct from success', () {
+  test('failure codes stay no_session unsupported and inject_failed', () {
     expect(
-      {semanticOk, semanticNoSession, semanticUnsupported, semanticInjectFailed}
-          .length,
-      4,
+      {semanticNoSession, semanticUnsupported, semanticInjectFailed}.length,
+      3,
     );
     expect(semanticImeShow, 'show');
     expect(semanticImeHide, 'hide');
+  });
+
+  test('enqueue ok is not success until the peer result is ok', () {
+    expect(semanticCompletion(null), semanticResultMissing);
+    expect(semanticCompletion(''), semanticResultMissing);
+    expect(semanticCompletion('   '), semanticResultMissing);
+    expect(semanticPeerSuccess(semanticCompletion(null)), isFalse);
+    expect(semanticPeerSuccess(semanticCompletion('')), isFalse);
+    expect(semanticResultMissing, isNot(semanticOk));
+    expect(semanticResultMissing, contains(semanticInjectFailed));
+    expect(semanticPeerSuccess(semanticOk), isTrue);
+    expect(semanticPeerSuccess(semanticNoSession), isFalse);
+    expect(semanticPeerSuccess(semanticUnsupported), isFalse);
+    expect(semanticPeerSuccess(semanticInjectFailed), isFalse);
   });
 }
