@@ -11,10 +11,12 @@ import 'package:flutter_hbb/models/state_model.dart';
 import '../../consts.dart';
 import '../../common/widgets/overlay.dart';
 import '../../common/widgets/remote_input.dart';
+import '../../common/widgets/semantic_action_bar.dart';
 import '../../common.dart';
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/toolbar.dart';
 import '../../models/model.dart';
+import '../../models/semantic_action_bind.dart';
 import '../../models/input_model.dart';
 import '../../models/platform_model.dart';
 import '../../models/shortcut_model.dart';
@@ -799,8 +801,16 @@ class _RemotePageState extends State<RemotePage>
     return Scaffold(
       backgroundColor: Theme.of(context).colorScheme.background,
       body: Obx(() {
-        final imageReady = _ffi.ffiModel.pi.isSet.isTrue &&
-            _ffi.ffiModel.waitForFirstImage.isFalse;
+        final connected = _ffi.ffiModel.pi.isSet.isTrue;
+        final imageReady =
+            connected && _ffi.ffiModel.waitForFirstImage.isFalse;
+        final session = Column(
+          children: [
+            Expanded(child: bodyWidget()),
+            if (connected && _ffi.ffiModel.isPeerAndroid)
+              SemanticActionBar(port: semanticActionPort(sessionId)),
+          ],
+        );
         if (imageReady) {
           // If the privacy mode(disable physical displays) is switched,
           // we should not dismiss the dialog immediately.
@@ -815,13 +825,13 @@ class _RemotePageState extends State<RemotePage>
           }
           // Block the whole `bodyWidget()` when dialog shows.
           return BlockableOverlay(
-            underlying: bodyWidget(),
+            underlying: session,
             state: _blockableOverlayState,
           );
         } else {
           // `_blockableOverlayState` is not recreated here.
           // The toolbar's block state won't work properly when reconnecting, but that's okay.
-          return bodyWidget();
+          return session;
         }
       }),
     );
