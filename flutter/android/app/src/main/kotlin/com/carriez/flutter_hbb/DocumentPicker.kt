@@ -15,8 +15,7 @@ internal class DocumentPicker(private val activity: Activity) {
 
     fun handle(call: MethodCall, result: MethodChannel.Result): Boolean {
         when (call.method) {
-            "document_require_log_folder" ->
-                requireLogFolder(result, call.argument<Boolean>("checkOnly") == true)
+            "document_require_log_folder" -> requireLogFolder(result)
             "document_workspace" -> if (call.argument<Boolean>("share") == true) {
                 run(result) { storage.shareWorkspace() }
             } else {
@@ -44,19 +43,6 @@ internal class DocumentPicker(private val activity: Activity) {
     }
 
     fun onResult(requestCode: Int, resultCode: Int, data: Intent?): Boolean {
-        if (requestCode == REQUEST_LOG_FOLDER) {
-            val result = pendingLogFolder ?: return true
-            pendingLogFolder = null
-            if (resultCode != Activity.RESULT_OK || data?.data == null) {
-                result.success(false)
-            } else {
-                run(result) {
-                    storage.logs.select(requireNotNull(data.data), data.flags)
-                    true
-                }
-            }
-            return true
-        }
         if (requestCode != REQUEST_DOCUMENT) return false
         val (result, share) = pending ?: return true
         pending = null
@@ -88,7 +74,7 @@ internal class DocumentPicker(private val activity: Activity) {
         }
     }
 
-    private fun requireLogFolder(result: MethodChannel.Result, checkOnly: Boolean) {
+    private fun requireLogFolder(result: MethodChannel.Result) {
         if (pending != null || pendingLogFolder != null) {
             result.error("picker_in_progress", "Another document picker is already open", null)
             return
@@ -96,21 +82,15 @@ internal class DocumentPicker(private val activity: Activity) {
         pendingLogFolder = result
         thread {
             val ready = runCatching { storage.logs.ensureReady() }
-            activity.runOnUiThread { completeLogFolderCheck(result, ready, checkOnly) }
+            activity.runOnUiThread { completeLogFolderCheck(result, ready) }
         }
     }
 
-    private fun completeLogFolderCheck(
-        result: MethodChannel.Result, ready: Result<Boolean>, checkOnly: Boolean
-    ) {
+    private fun completeLogFolderCheck(result: MethodChannel.Result, ready: Result<Boolean>) {
         if (pendingLogFolder !== result) return
         ready.fold(onSuccess = {
-            if (it || checkOnly) {
-                pendingLogFolder = null
-                result.success(it)
-            } else {
-                pickLogFolder(result)
-            }
+            pendingLogFolder = null
+            result.success(it)
         }, onFailure = {
             pendingLogFolder = null
             result.error("log_directory_failed", it.message, null)
@@ -127,17 +107,7 @@ internal class DocumentPicker(private val activity: Activity) {
             }
         }
 
-    private fun pickLogFolder(result: MethodChannel.Result) {
-        try {
-            activity.startActivityForResult(treePickerIntent(DocumentLogs.PARENT_ID), REQUEST_LOG_FOLDER)
-        } catch (error: Exception) {
-            pendingLogFolder = null
-            result.error("picker_unavailable", error.message, null)
-        }
-    }
-
     companion object {
         private const val REQUEST_DOCUMENT = 4251
-        private const val REQUEST_LOG_FOLDER = 4252
     }
 }

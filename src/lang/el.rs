@@ -823,5 +823,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Please select Android → media.", "Παρακαλώ επιλέξτε Android → media."),
         ("Trust duration (days)", "Διάρκεια εμπιστοσύνης (ημέρες)"),
         ("Renew trust", "Ανανέωση εμπιστοσύνης"),
+        ("Accessibility → Installed services → RustDesk Input", "Προσβασιμότητα → Εγκατεστημένες υπηρεσίες → RustDesk Input"),
+        ("App info → RustDesk → ⋮ → 允许受限制的设置 / 允许受限设置, then retry overlay and accessibility.", "Πληροφορίες εφαρμογής → RustDesk → ⋮ → 允许受限制的设置 / 允许受限设置, έπειτα ξαναδοκιμάστε την επικάλυψη και την προσβασιμότητα."),
     ].iter().cloned().collect();
 }
