@@ -55,6 +55,13 @@ void main() {
       expect(frame.h * frame.scale, 200);
     });
 
+    test('treats Android original and unset styles as contain', () {
+      expect(androidViewUsesContain(''), isTrue);
+      expect(androidViewUsesContain('original'), isTrue);
+      expect(androidViewUsesContain('adaptive'), isTrue);
+      expect(androidViewUsesContain('custom'), isFalse);
+    });
+
     test('does not invent a scale for an empty view or content', () {
       final frame = containFit(
         contentW: 1080,

@@ -2293,8 +2293,7 @@ class CanvasModel with ChangeNotifier {
   double get y => _y;
   double get scale => _scale;
 
-  // Android default and adaptive views. Null for other peers and for an
-  // explicit original or custom scale.
+  // Android letterbox. Null for other peers and for an explicit custom scale.
   ViewportFrame? get frame => _containFrame();
   bool get locked => _locked;
   double get devicePixelRatio => _devicePixelRatio;
@@ -2461,12 +2460,11 @@ class CanvasModel with ChangeNotifier {
     }
   }
 
-  // Letterbox an Android session unless the user picked original or custom.
+  // Letterbox an Android session, including the desktop default `original`.
+  // Custom stays an explicit zoom. A fresh peer is stored as adaptive.
   bool _usesContainFit() {
     if (parent.target?.ffiModel.isPeerAndroid != true) return false;
-    final style = _lastViewStyle.style;
-    return style != kRemoteViewStyleOriginal &&
-        style != kRemoteViewStyleCustom;
+    return androidViewUsesContain(_lastViewStyle.style);
   }
 
   ViewportFrame? _containFrame() {

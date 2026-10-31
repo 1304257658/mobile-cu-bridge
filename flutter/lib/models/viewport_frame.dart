@@ -31,6 +31,13 @@ class ViewportFrame {
 
 bool _usable(double v) => v.isFinite && v > 0;
 
+/// Whether an Android session letterboxes for [style].
+///
+/// The desktop client writes `original` as the default for a new peer. That
+/// value, an unset style, and `adaptive` all contain-fit. `custom` stays an
+/// explicit zoom.
+bool androidViewUsesContain(String style) => style != 'custom';
+
 /// Scale [contentW] x [contentH] uniformly so it fits inside the view.
 ///
 /// The same scale is used on both axes, so the content is not stretched.
