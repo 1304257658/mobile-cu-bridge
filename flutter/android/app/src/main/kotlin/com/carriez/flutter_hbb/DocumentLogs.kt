@@ -7,7 +7,9 @@ import android.os.ParcelFileDescriptor
 import android.provider.DocumentsContract
 import android.provider.DocumentsContract.Document
 import android.util.Log
+import java.io.File
 import java.io.FileNotFoundException
+import java.io.FileOutputStream
 import java.io.IOException
 import java.util.UUID
 import java.util.concurrent.TimeUnit
@@ -26,9 +28,19 @@ internal class DocumentLogs(private val context: Context) {
     private var openedDay = 0L
     private var failure: Exception? = null
     private val lock = ReentrantLock()
+    private var privateDir: File? = null
+    private var privateStream: FileOutputStream? = null
+    private var privateWritten = 0L
+    private var privateOpenedDay = 0L
+    private var privateMode = false
 
     init {
-        setEnabled(grant() != null)
+        val permitted = runCatching { hasPermission() }.getOrDefault(false)
+        if (permitted) {
+            setEnabled(true)
+        } else if (!runCatching { lock.withLock { ensurePrivateReadyLocked() } }.getOrDefault(false)) {
+            runCatching { setEnabled(false) }
+        }
     }
 
     @androidx.annotation.Keep
@@ -117,16 +129,103 @@ internal class DocumentLogs(private val context: Context) {
     }
 
     fun ensureReady(): Boolean = lock.withLock {
+        if (hasPermission()) {
+            try {
+                if (prepareGrantedLocked()) return@withLock true
+            } catch (error: Exception) {
+                Log.w("DocumentLogs", "Authorized log folder is unavailable", error)
+                closeOutput()
+            }
+        }
+        // No persisted tree grant is required. App-private storage is enough,
+        // and Start service must not open a folder picker.
+        ensurePrivateReadyLocked()
+    }
+
+    private fun prepareGrantedLocked(): Boolean {
         setEnabled(false)
         if (!hasPermission()) return false
         val uri = grant() ?: return false
         val root = DocumentsContract.buildDocumentUriUsingTree(uri, DocumentsContract.getTreeDocumentId(uri))
         if (!isDirectory(root)) return false
         ensureDirectory(uri)
+        closePrivate()
+        privateMode = false
         failure = null
         if (output == null) openNext(uri)
         setEnabled(true)
         return true
+    }
+
+    private fun ensurePrivateReadyLocked(): Boolean {
+        setEnabled(false)
+        closeOutput()
+        val dir = createPrivateLogDir()
+        privateDir = dir
+        privateMode = true
+        failure = null
+        setEnabled(true)
+        return true
+    }
+
+    private fun createPrivateLogDir(): File {
+        val roots = listOfNotNull(context.getExternalFilesDir(null), context.filesDir)
+        var last = IOException("Unable to create the log directory")
+        for (root in roots) {
+            val dir = File(root, "Logs")
+            if (dir.isDirectory || dir.mkdirs()) return dir
+            last = IOException("Unable to create ${dir.path}")
+        }
+        throw last
+    }
+
+    private fun closePrivate() {
+        val stream = privateStream
+        privateStream = null
+        stream?.close()
+    }
+
+    private fun openNextPrivate() {
+        closePrivate()
+        val dir = privateDir ?: throw IOException("The log directory is not open")
+        val name = "rustdesk-${System.currentTimeMillis()}-${UUID.randomUUID()}.txt"
+        val file = File(dir, name)
+        privateStream = FileOutputStream(file)
+        privateWritten = 0L
+        privateOpenedDay = currentDay()
+        val logs = dir.listFiles(java.io.FileFilter { entry ->
+            entry.isFile && LOG_NAME.matches(entry.name)
+        })?.sortedBy { it.name } ?: return
+        for (old in logs.filter { it != file }.take((logs.size - MAX_LOG_FILES).coerceAtLeast(0))) {
+            if (!old.delete()) {
+                Log.w("DocumentLogs", "Unable to remove an expired log file")
+            }
+        }
+    }
+
+    private fun writePrivateLocked(message: String): Boolean {
+        failure?.let { throw IOException("File logging stopped: ${it.message}", it) }
+        try {
+            if (privateStream == null || privateWritten >= MAX_LOG_BYTES || privateOpenedDay != currentDay()) {
+                openNextPrivate()
+            }
+            val bytes = message.toByteArray(Charsets.UTF_8)
+            val stream = privateStream ?: throw IOException("The log file is not open")
+            stream.write(bytes)
+            stream.flush()
+            privateWritten += bytes.size
+            return true
+        } catch (error: Exception) {
+            setEnabled(false)
+            failure = error
+            try {
+                closePrivate()
+            } catch (closeError: Exception) {
+                error.addSuppressed(closeError)
+            }
+            Log.e("DocumentLogs", "File logging stopped", error)
+            throw error
+        }
     }
 
     fun write(message: String): Boolean {
@@ -139,6 +238,7 @@ internal class DocumentLogs(private val context: Context) {
     }
 
     private fun writeLocked(message: String): Boolean {
+        if (privateMode) return writePrivateLocked(message)
         val uri = grant() ?: return false
         failure?.let { throw IOException("File logging stopped: ${it.message}", it) }
         try {
@@ -227,8 +327,8 @@ internal class DocumentLogs(private val context: Context) {
     }
 
     fun exportTo(destination: Uri): Int {
+        if (privateMode || !hasPermission()) return 0
         val uri = grant() ?: return 0
-        check(hasPermission()) { "Log directory access was revoked" }
         val parent = DocumentsContract.buildDocumentUriUsingTree(
             destination, DocumentsContract.getTreeDocumentId(destination))
         val logs = files(uri)

@@ -823,5 +823,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Please select Android → media.", "Válassza az Android → media mappát."),
         ("Trust duration (days)", "Megbízhatóság időtartama (nap)"),
         ("Renew trust", "Megbízhatóság megújítása"),
+        ("Accessibility → Installed services → RustDesk Input", "Kisegítő lehetőségek → Telepített szolgáltatások → RustDesk Input"),
+        ("App info → RustDesk → ⋮ → 允许受限制的设置 / 允许受限设置, then retry overlay and accessibility.", "Alkalmazásinformáció → RustDesk → ⋮ → 允许受限制的设置 / 允许受限设置, majd próbálja újra az átfedést és a kisegítő lehetőségeket."),
     ].iter().cloned().collect();
 }

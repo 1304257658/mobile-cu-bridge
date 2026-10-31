@@ -823,5 +823,7 @@ pub static ref T: std::collections::HashMap<&'static str, &'static str> =
         ("Please select Android → media.", "Bitte wählen Sie Android → media."),
         ("Trust duration (days)", "Vertrauensdauer (Tage)"),
         ("Renew trust", "Vertrauen erneuern"),
+        ("Accessibility → Installed services → RustDesk Input", "Bedienungshilfen → Installierte Dienste → RustDesk Input"),
+        ("App info → RustDesk → ⋮ → 允许受限制的设置 / 允许受限设置, then retry overlay and accessibility.", "App-Info → RustDesk → ⋮ → 允许受限制的设置 / 允许受限设置, dann Overlay und Bedienungshilfen erneut aktivieren."),
     ].iter().cloned().collect();
 }

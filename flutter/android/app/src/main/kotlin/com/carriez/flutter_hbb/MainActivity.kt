@@ -334,8 +334,7 @@ class MainActivity : FlutterActivity() {
                 }
                 START_ACTION -> {
                     if (call.arguments is String) {
-                        startAction(context, call.arguments as String)
-                        result.success(true)
+                        result.success(startAction(context, call.arguments as String))
                     } else {
                         result.success(false)
                     }

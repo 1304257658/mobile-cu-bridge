@@ -29,6 +29,7 @@ class ServerModel with ChangeNotifier {
   bool _isStart = false; // Android MainService status
   bool _mediaOk = false;
   bool _inputOk = false;
+  bool _inputSettingsLaunchFailed = false;
   bool _audioOk = false;
   bool _fileOk = false;
   bool _clipboardOk = false;
@@ -59,6 +60,8 @@ class ServerModel with ChangeNotifier {
   bool get mediaOk => _mediaOk;
 
   bool get inputOk => _inputOk;
+
+  bool get inputSettingsLaunchFailed => _inputSettingsLaunchFailed;
 
   bool get audioOk => _audioOk;
 
@@ -338,12 +341,15 @@ class ServerModel with ChangeNotifier {
     if (_inputOk) {
       parent.target?.invokeMethod("stop_input");
       bind.mainSetOption(key: kOptionEnableKeyboard, value: 'N');
-    } else {
-      if (parent.target != null) {
-        /// the result of toggle-on depends on user actions in the settings page.
-        /// handle result, see [ServerModel.changeStatue]
-        showInputWarnAlert(parent.target!);
-      }
+      _inputSettingsLaunchFailed = false;
+      notifyListeners();
+    } else if (isAndroid && parent.target != null) {
+      final opened = await AndroidPermissionManager.startAction(
+          kActionAccessibilitySettings);
+      _inputSettingsLaunchFailed = !opened;
+      notifyListeners();
+    } else if (parent.target != null) {
+      showInputWarnAlert(parent.target!);
     }
   }
 
@@ -487,6 +493,7 @@ class ServerModel with ChangeNotifier {
               value: value ? defaultOptionYes : 'N');
         }
         _inputOk = value;
+        if (value) _inputSettingsLaunchFailed = false;
         break;
       default:
         return;
