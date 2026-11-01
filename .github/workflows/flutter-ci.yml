@@ -22,3 +22,17 @@ jobs:
     uses: ./.github/workflows/flutter-build.yml
     with:
       upload-artifact: false
+
+  semantic-set-text:
+    name: set_text read-back decision
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run set_text decision unit tests
+        run: bash flutter/android/semantic-set-text-test.sh
