@@ -136,8 +136,8 @@ class SemanticActionRunner {
 /// `sys.back`, `sys.home`, and `sys.recents` are immediate buttons.
 /// `ime`, `open_app`, and `set_text` each have one line and a confirm
 /// on this bar. The whole bar is grey and inert while a peer result is
-/// outstanding. Peer `ok` is a short toast. Any other completion is the
-/// code in plaintext on the bar.
+/// outstanding. Peer `ok` is a short toast above the bar. Any other
+/// completion is the code in plaintext on the bar.
 class SemanticActionBar extends StatefulWidget {
   const SemanticActionBar({
     super.key,
@@ -181,11 +181,21 @@ class _SemanticActionBarState extends State<SemanticActionBar> {
       },
       onPeerSuccess: () {
         if (!mounted) return;
+        // Floating snackbars pin to the scaffold bottom, on top of this bar.
+        // The bottom margin is the bar's height so the toast sits above the keys.
+        final render = context.findRenderObject();
+        final barHeight =
+            render is RenderBox && render.hasSize ? render.size.height : 0.0;
+        var lift = barHeight + 8;
+        final room = MediaQuery.sizeOf(context).height - 48;
+        if (room > 0 && lift > room) lift = room;
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('ok'),
-            duration: Duration(seconds: 2),
+          SnackBar(
+            content: const Text('ok'),
+            duration: const Duration(seconds: 2),
             behavior: SnackBarBehavior.floating,
+            margin: EdgeInsets.fromLTRB(15, 5, 15, lift),
+            hitTestBehavior: HitTestBehavior.deferToChild,
           ),
         );
       },

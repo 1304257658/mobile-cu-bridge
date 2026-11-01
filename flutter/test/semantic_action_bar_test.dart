@@ -170,6 +170,72 @@ void main() {
     expect(calls.length, 3);
     expect(find.text('ok'), findsNothing);
   });
+
+  testWidgets('peer ok sits above the bar and inject_failed stays on it',
+      (tester) async {
+    final calls = <List<String>>[];
+    var peer = semanticResultMissing;
+    await tester.pumpWidget(MaterialApp(
+      home: Scaffold(
+        body: Column(
+          children: [
+            const Expanded(child: SizedBox.shrink()),
+            SemanticActionBar(
+              port: SemanticActionPort(
+                enqueue: (kind, arg) {
+                  calls.add([kind, arg]);
+                  return semanticOk;
+                },
+                peerResult: () => peer,
+              ),
+              pollInterval: const Duration(milliseconds: 10),
+              timeout: const Duration(seconds: 5),
+            ),
+          ],
+        ),
+      ),
+    ));
+
+    await tester.tap(find.text(semanticSysHome));
+    await tester.pump();
+    peer = semanticOk;
+    await tester.pump(const Duration(milliseconds: 10));
+    await tester.pump(const Duration(milliseconds: 400));
+
+    expect(find.text('ok'), findsOneWidget);
+    expect(find.byKey(const Key('semantic-failure')), findsNothing);
+    final bar = tester.getRect(find.byKey(const Key('semantic-action-bar')));
+    final toast = tester.getRect(find.text('ok'));
+    expect(toast.bottom, lessThanOrEqualTo(bar.top));
+    expect(toast.top, greaterThanOrEqualTo(0));
+    for (final kind in semanticKinds) {
+      final button = find.widgetWithText(TextButton, kind);
+      expect(toast.overlaps(tester.getRect(button)), isFalse);
+      expect(tester.widget<TextButton>(button).onPressed, isNotNull);
+    }
+
+    peer = semanticInjectFailed;
+    await tester.tap(find.text(semanticSysBack));
+    await tester.pump();
+    expect(calls, [
+      [semanticSysHome, ''],
+      [semanticSysBack, ''],
+    ]);
+    final failure = tester.getRect(find.byKey(const Key('semantic-failure')));
+    final barAfter =
+        tester.getRect(find.byKey(const Key('semantic-action-bar')));
+    expect(find.text(semanticInjectFailed), findsOneWidget);
+    expect(barAfter.overlaps(failure), isTrue);
+    expect(tester.getRect(find.text('ok')).overlaps(failure), isFalse);
+    for (final kind in semanticKinds) {
+      expect(
+        failure.overlaps(
+          tester.getRect(find.widgetWithText(TextButton, kind)),
+        ),
+        isFalse,
+      );
+    }
+  });
 }
 
 Widget _harness(Widget child) {
