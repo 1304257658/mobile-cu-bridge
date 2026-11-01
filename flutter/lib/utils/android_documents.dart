@@ -41,19 +41,8 @@ class AndroidDocuments {
   static Future<bool> requireLogFolder() async {
     gFFI.ffiModel.beginAndroidDocumentPicker();
     try {
-      final ready = await gFFI.invokeMethodWithResult<bool>(
-          'document_require_log_folder', {'checkOnly': true});
-      if (ready == null) {
-        throw StateError('Log directory setup did not complete');
-      }
-      if (ready) return true;
-      if (!await _confirmLogFolder()) return false;
-      final selected = await gFFI
-          .invokeMethodWithResult<bool>('document_require_log_folder');
-      if (selected == null) {
-        throw StateError('Log directory setup did not complete');
-      }
-      return selected;
+      return await prepareAndroidLogFolder(() => gFFI.invokeMethodWithResult<bool>(
+          'document_require_log_folder', {'checkOnly': true}));
     } catch (error) {
       debugPrint('Log directory setup failed');
       await gFFI.dialogManager.show<void>(
@@ -77,22 +66,11 @@ class AndroidDocuments {
     }
   }
 
-  static Future<bool> _confirmLogFolder() async =>
-      await gFFI.dialogManager.show<bool>(
-        (_, close, __) => CustomAlertDialog(
-          title: Text(translate('Permissions')),
-          content: Text(
-              '${translate('android-logs-folder-tip')}\n'),
-          actions: [
-            TextButton(
-              onPressed: () => close(true),
-              child: Text(translate('Choose folder')),
-            ),
-          ],
-          onCancel: () => close(false),
-        ),
-        backDismiss: true,
-        forceGlobal: true,
-      ) ==
-      true;
+}
+
+/// App-private storage is the log directory. A `true` result means Start
+/// service can continue; anything else is a failure, not a folder choice.
+Future<bool> prepareAndroidLogFolder(Future<bool?> Function() ensureReady) async {
+  if (await ensureReady() == true) return true;
+  throw StateError('Log directory setup did not complete');
 }

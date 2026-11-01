@@ -64,6 +64,8 @@ final isWebOnMacOs = isWebOnMacOS_;
 var isMobile = isAndroid || isIOS;
 var version = '';
 int androidVersion = 0;
+String androidManufacturer = '';
+String androidBrand = '';
 
 // Only used on Linux.
 // `windowManager.setResizable(false)` will reset the window size to the default size on Linux.
@@ -1527,8 +1529,9 @@ class AndroidPermissionManager {
   }
 
   // startActivity goto Android Setting's page to request permission manually by user
-  static void startAction(String action) {
-    gFFI.invokeMethod(AndroidChannel.kStartAction, action);
+  static Future<bool> startAction(String action) async {
+    final opened = await gFFI.invokeMethod(AndroidChannel.kStartAction, action);
+    return opened == true;
   }
 
   /// We use XXPermissions to request permissions,
