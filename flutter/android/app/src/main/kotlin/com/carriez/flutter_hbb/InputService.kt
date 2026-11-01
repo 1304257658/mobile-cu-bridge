@@ -882,6 +882,7 @@ class InputService : AccessibilityService() {
             // AccessibilityInputConnection on SDK 33+ is not InputConnection.
             // It has no getExtractedText / batch edit; surrounding text plus
             // commitText(text, pos, textAttribute) is the supported replace.
+            // commitText returns void, so the result is the read-back below.
             val surrounding = ic.getSurroundingText(SEMANTIC_TEXT_MAX, SEMANTIC_TEXT_MAX, 0)
                 ?: return null
             val existing = surrounding.text?.length ?: 0
@@ -892,7 +893,19 @@ class InputService : AccessibilityService() {
             val start = surrounding.offset
             ic.setSelection(start, start + existing)
             ic.commitText(text, 1, null)
-            "ok"
+            val readBack = ic.getSurroundingText(SEMANTIC_TEXT_MAX, SEMANTIC_TEXT_MAX, 0)
+            val result = semanticCommitResult(
+                text,
+                readBack?.let { it.text?.toString() ?: "" },
+                readBack?.offset ?: -1,
+                readBack?.selectionStart ?: -1,
+                readBack?.selectionEnd ?: -1,
+                SEMANTIC_TEXT_MAX,
+            )
+            if (result != "ok") {
+                Log.e(logTag, "set_text unverified after commitText")
+            }
+            result
         } catch (e: RuntimeException) {
             Log.e(logTag, "set_text input connection failed", e)
             "inject_failed"
