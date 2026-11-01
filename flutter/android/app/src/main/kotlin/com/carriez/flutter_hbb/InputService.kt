@@ -10,7 +10,6 @@ import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
 import android.content.ComponentName
 import android.content.Intent
-import android.view.inputmethod.ExtractedTextRequest
 import android.graphics.Path
 import android.os.Build
 import android.os.Bundle
@@ -880,22 +879,20 @@ class InputService : AccessibilityService() {
         }
         val ic = getInputMethod()?.currentInputConnection ?: return null
         return try {
-            val req = ExtractedTextRequest()
-            req.hintMaxChars = SEMANTIC_TEXT_MAX
-            val extracted = ic.getExtractedText(req, 0) ?: return null
-            val existing = extracted.text?.length ?: 0
+            // AccessibilityInputConnection on SDK 33+ is not InputConnection.
+            // It has no getExtractedText / batch edit; surrounding text plus
+            // commitText(text, pos, textAttribute) is the supported replace.
+            val surrounding = ic.getSurroundingText(SEMANTIC_TEXT_MAX, SEMANTIC_TEXT_MAX, 0)
+                ?: return null
+            val existing = surrounding.text?.length ?: 0
             if (existing >= SEMANTIC_TEXT_MAX) {
                 Log.e(logTag, "set_text refused: focused field is at least $SEMANTIC_TEXT_MAX chars")
                 return "inject_failed"
             }
-            ic.beginBatchEdit()
-            val committed = try {
-                ic.setSelection(0, existing)
-                ic.commitText(text, 1)
-            } finally {
-                ic.endBatchEdit()
-            }
-            if (committed) "ok" else "inject_failed"
+            val start = surrounding.offset
+            ic.setSelection(start, start + existing)
+            ic.commitText(text, 1, null)
+            "ok"
         } catch (e: RuntimeException) {
             Log.e(logTag, "set_text input connection failed", e)
             "inject_failed"
