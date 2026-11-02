@@ -5,6 +5,9 @@
 //! package intent, or the focused field). The peer answers with
 //! [`SemanticActionResult`]. Host input injection, the clipboard, and
 //! pointer hits are not this path.
+//!
+//! `open_app` starts a launcher intent and is `ok` only after that package
+//! is in the foreground. It does not tap the desktop.
 
 use base::message_proto::{Message, SemanticAction, SemanticActionResult};
 use hbb_common::{log, protobuf::Message as _};
@@ -38,6 +41,16 @@ pub const IN_FLIGHT: &str = "inject_failed: action in flight";
 /// into a session message.
 pub const SET_TEXT_MAX: usize = 16 * 1024;
 pub const OPEN_APP_MAX: usize = 256;
+
+/// Peer `open_app` failures. Each is at most 32 bytes so [`normalize_peer_code`]
+/// can keep it. Anything else collapses to [`INJECT_FAILED`].
+pub const NOT_INSTALLED: &str = "inject_failed: not_installed";
+pub const NO_PERMISSION: &str = "inject_failed: no_permission";
+pub const TIMED_OUT: &str = "inject_failed: timeout";
+
+/// Hard bound for the connection task waiting on `open_app`. The foreground
+/// poll stops at 2.5s; this also covers a hung accessibility call.
+pub const OPEN_APP_BLOCKING_TIMEOUT_MS: u64 = 5_000;
 
 /// What the controller knows before it tries to enqueue.
 #[derive(Clone, Copy)]
@@ -198,6 +211,9 @@ pub fn normalize_peer_code(code: &str) -> &'static str {
         OK => OK,
         UNSUPPORTED => UNSUPPORTED,
         INJECT_FAILED => INJECT_FAILED,
+        NOT_INSTALLED => NOT_INSTALLED,
+        NO_PERMISSION => NO_PERMISSION,
+        TIMED_OUT => TIMED_OUT,
         _ => {
             log::warn!("semantic action peer code `{code}` is not a known result");
             INJECT_FAILED
@@ -459,5 +475,40 @@ mod tests {
             }
             other => panic!("expected SemanticActionResult, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn open_app_failures_stay_explicit_and_share_the_flight() {
+        let ready = desktop("Android");
+        for code in [NOT_INSTALLED, NO_PERMISSION, TIMED_OUT] {
+            assert_eq!(normalize_peer_code(code), code, "{code}");
+            assert!(!is_peer_success(code), "{code}");
+            assert!(code.len() <= 32, "{code}");
+            let reply = result_message(OPEN_APP, code);
+            match reply.union {
+                Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
+                    assert_eq!(result.kind, OPEN_APP);
+                    assert_eq!(result.code, code);
+                }
+                other => panic!("expected SemanticActionResult, got {other:?}"),
+            }
+        }
+
+        let mut flight = Flight::default();
+        prepare_send(&mut flight, gate(&ready, OPEN_APP, "com.android.settings")).unwrap();
+        assert_eq!(
+            prepare_send(&mut flight, gate(&ready, OPEN_APP, "com.android.settings")),
+            Err(IN_FLIGHT)
+        );
+        flight.finish(NOT_INSTALLED);
+        assert_eq!(flight.result(), NOT_INSTALLED);
+        assert!(!is_peer_success(flight.result()));
+
+        prepare_send(&mut flight, OK).unwrap();
+        flight.finish(TIMED_OUT);
+        assert_eq!(flight.result(), TIMED_OUT);
+        assert!(!is_peer_success(flight.result()));
+        assert!(OPEN_APP_BLOCKING_TIMEOUT_MS > 2_500);
+        assert!(OPEN_APP_BLOCKING_TIMEOUT_MS <= 8_000);
     }
 }

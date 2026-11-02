@@ -4136,6 +4136,32 @@ impl Connection {
                         crate::semantic_action::UNSUPPORTED
                     } else if !self.peer_keyboard_enabled() {
                         crate::semantic_action::INJECT_FAILED
+                    } else if action.kind == crate::semantic_action::OPEN_APP {
+                        // Foreground polling is bounded inside the peer. This
+                        // outer bound also returns if that call never comes back.
+                        let kind = action.kind.clone();
+                        let arg = action.arg.clone();
+                        match timeout(
+                            crate::semantic_action::OPEN_APP_BLOCKING_TIMEOUT_MS,
+                            tokio::task::spawn_blocking(move || {
+                                crate::semantic_action::execute_on_peer(&kind, &arg)
+                            }),
+                        )
+                        .await
+                        {
+                            Ok(Ok(code)) => code,
+                            Ok(Err(e)) => {
+                                log::error!("semantic open_app wait task failed: {e}");
+                                crate::semantic_action::INJECT_FAILED
+                            }
+                            Err(_) => {
+                                log::error!(
+                                    "semantic open_app exceeded {} ms",
+                                    crate::semantic_action::OPEN_APP_BLOCKING_TIMEOUT_MS
+                                );
+                                crate::semantic_action::TIMED_OUT
+                            }
+                        }
                     } else {
                         crate::semantic_action::execute_on_peer(&action.kind, &action.arg)
                     };

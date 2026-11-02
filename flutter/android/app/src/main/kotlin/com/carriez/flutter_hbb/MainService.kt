@@ -96,7 +96,11 @@ class MainService : Service() {
 
     @Keep
     fun rustSemanticAction(kind: String, arg: String): String {
-        val svc = InputService.ctx ?: return "inject_failed"
+        val svc = InputService.ctx ?: return if (kind == "open_app") {
+            OPEN_NO_PERMISSION
+        } else {
+            "inject_failed"
+        }
         return svc.performSemanticAction(kind, arg)
     }
 

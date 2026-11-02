@@ -1001,7 +1001,9 @@ message SemanticAction {
   string arg = 2;
 }
 
-// Peer result for a SemanticAction. code is ok, unsupported, or inject_failed.
+// Peer result for a SemanticAction. code is ok, unsupported, inject_failed,
+// or an allowlisted open_app reason: inject_failed: not_installed,
+// inject_failed: no_permission, inject_failed: timeout.
 // no_session is decided on the controller and is never sent by the peer.
 message SemanticActionResult {
   string kind = 1;

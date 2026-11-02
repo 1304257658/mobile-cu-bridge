@@ -38,5 +38,14 @@ void main() {
     expect(semanticPeerSuccess(semanticInFlight), isFalse);
     expect(semanticInFlight, isNot(semanticOk));
     expect(semanticInFlight, isNot(semanticResultMissing));
+    for (final code in [
+      semanticNotInstalled,
+      semanticNoPermission,
+      semanticOpenTimeout,
+    ]) {
+      expect(semanticPeerSuccess(code), isFalse);
+      expect(code, contains(semanticInjectFailed));
+      expect(code, isNot(semanticOk));
+    }
   });
 }

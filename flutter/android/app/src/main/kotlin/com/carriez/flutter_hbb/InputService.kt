@@ -8,6 +8,7 @@ package com.carriez.flutter_hbb
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
+import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Path
@@ -15,6 +16,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.widget.EditText
 import android.view.accessibility.AccessibilityEvent
@@ -29,6 +31,8 @@ import android.accessibilityservice.AccessibilityServiceInfo.FLAG_INPUT_METHOD_E
 import android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
 import android.view.inputmethod.EditorInfo
 import androidx.annotation.RequiresApi
+import java.lang.InterruptedException
+import java.lang.SecurityException
 import java.util.*
 import java.lang.Character
 import kotlin.math.abs
@@ -774,8 +778,9 @@ class InputService : AccessibilityService() {
 
     /**
      * Session semantic shortcut. System keys use global accessibility actions,
-     * open_app starts a launcher intent, and set_text / ime write the focused
-     * field. No pointer gesture and no clipboard write.
+     * open_app starts a launcher intent and waits until that package is in
+     * front, and set_text / ime write the focused field. No pointer gesture
+     * and no clipboard write.
      */
     fun performSemanticAction(kind: String, arg: String): String {
         return when (kind) {
@@ -813,16 +818,16 @@ class InputService : AccessibilityService() {
         val slash = spec.indexOf('/')
         val pkg = if (slash < 0) spec else spec.substring(0, slash)
         if (pkg.isEmpty()) {
-            return "unsupported"
+            return OPEN_UNSUPPORTED
         }
         val intent = if (slash < 0) {
             packageManager.getLaunchIntentForPackage(pkg)?.apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            } ?: return "inject_failed"
+            } ?: return OPEN_NOT_INSTALLED
         } else {
             val activity = spec.substring(slash + 1)
             if (activity.isEmpty()) {
-                return "unsupported"
+                return OPEN_UNSUPPORTED
             }
             val cls = if (activity.startsWith(".")) pkg + activity else activity
             Intent(Intent.ACTION_MAIN).apply {
@@ -831,13 +836,81 @@ class InputService : AccessibilityService() {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         }
-        return try {
+        val start = try {
             startActivity(intent)
-            "ok"
+            OpenStart.STARTED
+        } catch (e: SecurityException) {
+            Log.e(logTag, "open_app $pkg permission", e)
+            OpenStart.NO_PERMISSION
+        } catch (e: ActivityNotFoundException) {
+            Log.e(logTag, "open_app $pkg missing", e)
+            OpenStart.NOT_INSTALLED
         } catch (e: RuntimeException) {
             Log.e(logTag, "open_app $pkg failed", e)
-            "inject_failed"
+            OpenStart.FAILED
         }
+        if (start != OpenStart.STARTED) {
+            return openAppPeerCode(start, false)
+        }
+        val code = openAppPeerCode(OpenStart.STARTED, waitUntilForeground(pkg))
+        if (code != OPEN_OK) {
+            Log.e(logTag, "open_app $pkg -> $code")
+        }
+        return code
+    }
+
+    private fun waitUntilForeground(pkg: String): Boolean {
+        val polls = openAppMaxPolls()
+        if (polls <= 0) return false
+        val deadline = SystemClock.uptimeMillis() + OPEN_APP_TIMEOUT_MS
+        var i = 0
+        var loggedReadFailure = false
+        while (i < polls && SystemClock.uptimeMillis() < deadline) {
+            try {
+                if (foregroundIs(pkg)) return true
+            } catch (e: RuntimeException) {
+                if (!loggedReadFailure) {
+                    loggedReadFailure = true
+                    Log.e(logTag, "open_app foreground read failed", e)
+                }
+            }
+            i += 1
+            if (i >= polls) return false
+            val left = deadline - SystemClock.uptimeMillis()
+            if (left <= 0L) return false
+            try {
+                Thread.sleep(minOf(OPEN_APP_POLL_MS, left))
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        return false
+    }
+
+    private fun foregroundIs(pkg: String): Boolean {
+        return rootPackageIs(pkg) || windowPackageIs(pkg)
+    }
+
+    private fun rootPackageIs(pkg: String): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val found = root.packageName?.toString() == pkg
+        if (Build.VERSION.SDK_INT < 33) root.recycle()
+        return found
+    }
+
+    private fun windowPackageIs(pkg: String): Boolean {
+        val wins = windows ?: return false
+        var found = false
+        for (w in wins) {
+            if (!found && (w.isActive || w.isFocused)) {
+                val root = w.root
+                if (root?.packageName?.toString() == pkg) found = true
+                if (Build.VERSION.SDK_INT < 33 && root != null) root.recycle()
+            }
+            if (Build.VERSION.SDK_INT < 33) w.recycle()
+        }
+        return found
     }
 
     private fun setFocusedText(text: String): String {
