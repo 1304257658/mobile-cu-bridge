@@ -560,6 +560,12 @@ class RustdeskImpl {
     return 'inject_failed: no peer result';
   }
 
+  // list_apps page text. Web has no peer, so there is no page.
+  String sessionSemanticDetail(
+      {required UuidValue sessionId, dynamic hint}) {
+    return '';
+  }
+
   Future<void> sessionSendChat(
       {required UuidValue sessionId, required String text, dynamic hint}) {
     return Future(

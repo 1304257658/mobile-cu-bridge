@@ -5,6 +5,10 @@
 //! package intent, or the focused field). The peer answers with
 //! [`SemanticActionResult`]. Host input injection, the clipboard, and
 //! pointer hits are not this path.
+//!
+//! `open_app` starts a launcher intent and is `ok` only after that package
+//! is in the foreground. `list_apps` is one page of launcher activities in
+//! the result `detail`. Neither action taps the desktop.
 
 use base::message_proto::{Message, SemanticAction, SemanticActionResult};
 use hbb_common::{log, protobuf::Message as _};
@@ -13,10 +17,19 @@ pub const SYS_BACK: &str = "sys.back";
 pub const SYS_HOME: &str = "sys.home";
 pub const SYS_RECENTS: &str = "sys.recents";
 pub const OPEN_APP: &str = "open_app";
+pub const LIST_APPS: &str = "list_apps";
 pub const IME: &str = "ime";
 pub const SET_TEXT: &str = "set_text";
 
-pub const KINDS: [&str; 6] = [SYS_BACK, SYS_HOME, SYS_RECENTS, OPEN_APP, IME, SET_TEXT];
+pub const KINDS: [&str; 7] = [
+    SYS_BACK,
+    SYS_HOME,
+    SYS_RECENTS,
+    OPEN_APP,
+    IME,
+    SET_TEXT,
+    LIST_APPS,
+];
 
 /// Enqueue acknowledgement from `session_semantic_action`, and the peer
 /// completion code from `session_semantic_result`. The enqueue value is not
@@ -38,6 +51,19 @@ pub const IN_FLIGHT: &str = "inject_failed: action in flight";
 /// into a session message.
 pub const SET_TEXT_MAX: usize = 16 * 1024;
 pub const OPEN_APP_MAX: usize = 256;
+
+/// Peer `open_app` / `list_apps` failures. Each is at most 32 bytes so
+/// [`normalize_peer_code`] can keep it. Anything else collapses to [`INJECT_FAILED`].
+pub const NOT_INSTALLED: &str = "inject_failed: not_installed";
+pub const NO_PERMISSION: &str = "inject_failed: no_permission";
+pub const TIMED_OUT: &str = "inject_failed: timeout";
+pub const CAP_EXCEEDED: &str = "inject_failed: cap";
+
+/// `list_apps` page offset. The peer refuses a launcher-activity list past this.
+pub const LIST_APPS_HARD_CAP: usize = 256;
+
+/// One `list_apps` page. A larger `detail` is not stored; the code becomes [`CAP_EXCEEDED`].
+pub const LIST_APPS_DETAIL_MAX: usize = 16 * 1024;
 
 /// What the controller knows before it tries to enqueue.
 #[derive(Clone, Copy)]
@@ -82,6 +108,13 @@ pub fn validate(kind: &str, arg: &str) -> &'static str {
                 UNSUPPORTED
             }
         }
+        LIST_APPS => {
+            if list_apps_arg_ok(arg) {
+                OK
+            } else {
+                UNSUPPORTED
+            }
+        }
         IME => match arg {
             "show" | "hide" => OK,
             _ => UNSUPPORTED,
@@ -112,11 +145,13 @@ pub fn action_message(kind: &str, arg: &str) -> Message {
     msg
 }
 
-pub fn result_message(kind: &str, code: &str) -> Message {
+pub fn result_message(kind: &str, code: &str, detail: &str) -> Message {
+    let outcome = PeerOutcome::accept(code, detail);
     let mut msg = Message::new();
     msg.set_semantic_action_result(SemanticActionResult {
         kind: kind.to_owned(),
-        code: normalize_peer_code(code).to_owned(),
+        code: outcome.code.to_owned(),
+        detail: outcome.detail,
         ..Default::default()
     });
     msg
@@ -147,6 +182,7 @@ pub fn is_peer_success(result: &str) -> bool {
 pub struct Flight {
     inflight: bool,
     code: String,
+    detail: String,
 }
 
 impl Flight {
@@ -157,6 +193,7 @@ impl Flight {
         }
         self.inflight = true;
         self.code.clear();
+        self.detail.clear();
         Ok(())
     }
 
@@ -166,13 +203,20 @@ impl Flight {
     }
 
     /// Peer completion. Another action may start.
-    pub fn finish(&mut self, code: &str) {
-        self.code = normalize_peer_code(code).to_owned();
+    pub fn finish(&mut self, code: &str, detail: &str) {
+        let outcome = PeerOutcome::accept(code, detail);
+        self.code = outcome.code.to_owned();
+        self.detail = outcome.detail;
         self.inflight = false;
     }
 
     pub fn result(&self) -> &str {
         require_peer_result(&self.code)
+    }
+
+    /// `list_apps` page when [`Self::result`] is `ok`. Empty for every other code.
+    pub fn detail(&self) -> &str {
+        &self.detail
     }
 }
 
@@ -198,6 +242,10 @@ pub fn normalize_peer_code(code: &str) -> &'static str {
         OK => OK,
         UNSUPPORTED => UNSUPPORTED,
         INJECT_FAILED => INJECT_FAILED,
+        NOT_INSTALLED => NOT_INSTALLED,
+        NO_PERMISSION => NO_PERMISSION,
+        TIMED_OUT => TIMED_OUT,
+        CAP_EXCEEDED => CAP_EXCEEDED,
         _ => {
             log::warn!("semantic action peer code `{code}` is not a known result");
             INJECT_FAILED
@@ -205,26 +253,89 @@ pub fn normalize_peer_code(code: &str) -> &'static str {
     }
 }
 
+/// What the peer returned. `detail` is kept only for `ok`, and only under
+/// [`LIST_APPS_DETAIL_MAX`]. A larger body is [`CAP_EXCEEDED`] and is not stored.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PeerOutcome {
+    pub code: &'static str,
+    pub detail: String,
+}
+
+impl PeerOutcome {
+    pub fn bare(code: &'static str) -> Self {
+        Self {
+            code: normalize_peer_code(code),
+            detail: String::new(),
+        }
+    }
+
+    pub fn accept(code: &str, detail: &str) -> Self {
+        let code = normalize_peer_code(code);
+        if code != OK {
+            return Self {
+                code,
+                detail: String::new(),
+            };
+        }
+        if detail.len() > LIST_APPS_DETAIL_MAX {
+            log::error!(
+                "semantic action detail is {} bytes, cap {LIST_APPS_DETAIL_MAX}",
+                detail.len()
+            );
+            return Self::bare(CAP_EXCEEDED);
+        }
+        Self {
+            code,
+            detail: detail.to_owned(),
+        }
+    }
+
+    /// JNI body. A newline separates the code from a `list_apps` page.
+    pub fn from_jni(raw: &str) -> Self {
+        let (code, detail) = match raw.split_once('\n') {
+            Some((code, detail)) => (code, detail),
+            None => (raw, ""),
+        };
+        Self::accept(code, detail)
+    }
+}
+
 /// Run an already-admitted action on this peer.
-pub fn execute_on_peer(kind: &str, arg: &str) -> &'static str {
+pub fn execute_on_peer(kind: &str, arg: &str) -> PeerOutcome {
     let verdict = validate(kind, arg);
     if verdict != OK {
-        return verdict;
+        return PeerOutcome::bare(verdict);
     }
     #[cfg(target_os = "android")]
     {
         return match scrap::android::call_main_service_semantic_action(kind, arg) {
-            Ok(code) => normalize_peer_code(&code),
+            Ok(raw) => PeerOutcome::from_jni(&raw),
             Err(e) => {
                 log::error!("semantic action jni failed: {e}");
-                INJECT_FAILED
+                PeerOutcome::bare(INJECT_FAILED)
             }
         };
     }
     #[cfg(not(target_os = "android"))]
     {
         let _ = (kind, arg);
-        UNSUPPORTED
+        PeerOutcome::bare(UNSUPPORTED)
+    }
+}
+
+fn list_apps_arg_ok(arg: &str) -> bool {
+    if arg.is_empty() {
+        return true;
+    }
+    if arg.len() > 3 || (arg.len() > 1 && arg.as_bytes()[0] == b'0') {
+        return false;
+    }
+    if !arg.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    match arg.parse::<usize>() {
+        Ok(n) => n <= LIST_APPS_HARD_CAP,
+        Err(_) => false,
     }
 }
 
@@ -294,7 +405,7 @@ mod tests {
 
     #[test]
     fn admits_system_text_and_launch_actions() {
-        assert_eq!(KINDS.len(), 6);
+        assert_eq!(KINDS.len(), 7);
         let g = desktop("Android");
         for kind in [SYS_BACK, SYS_HOME, SYS_RECENTS] {
             assert_eq!(gate(&g, kind, ""), OK, "{kind}");
@@ -304,6 +415,9 @@ mod tests {
         assert_eq!(gate(&g, SET_TEXT, ""), OK);
         assert_eq!(gate(&g, SET_TEXT, "hello"), OK);
         assert_eq!(gate(&g, OPEN_APP, "com.android.settings"), OK);
+        assert_eq!(gate(&g, LIST_APPS, ""), OK);
+        assert_eq!(gate(&g, LIST_APPS, "0"), OK);
+        assert_eq!(gate(&g, LIST_APPS, "256"), OK);
         assert_eq!(gate(&g, OPEN_APP, "com.android.settings/.Settings"), OK);
         assert_eq!(
             gate(
@@ -380,10 +494,13 @@ mod tests {
         assert_eq!(normalize_peer_code("inject_failed"), INJECT_FAILED);
         assert_eq!(normalize_peer_code("no_session"), INJECT_FAILED);
         assert_eq!(normalize_peer_code(&"x".repeat(33)), INJECT_FAILED);
-        assert_eq!(execute_on_peer(SYS_HOME, "x"), UNSUPPORTED);
-        assert_eq!(execute_on_peer("pixel", ""), UNSUPPORTED);
+        assert_eq!(execute_on_peer(SYS_HOME, "x").code, UNSUPPORTED);
+        assert_eq!(execute_on_peer("pixel", "").code, UNSUPPORTED);
         #[cfg(not(target_os = "android"))]
-        assert_eq!(execute_on_peer(SYS_HOME, ""), UNSUPPORTED);
+        assert_eq!(execute_on_peer(SYS_HOME, "").code, UNSUPPORTED);
+        assert_eq!(gate(&ready, LIST_APPS, "257"), UNSUPPORTED);
+        assert_eq!(gate(&ready, LIST_APPS, "00"), UNSUPPORTED);
+        assert_eq!(gate(&desktop("Linux"), LIST_APPS, ""), UNSUPPORTED);
     }
 
     #[test]
@@ -425,7 +542,7 @@ mod tests {
         assert_eq!(prepare_send(&mut flight, NO_SESSION), Err(NO_SESSION));
         assert_eq!(sent.len(), 1);
 
-        flight.finish("ok");
+        flight.finish("ok", "");
         assert!(is_peer_success(flight.result()));
         prepare_send(&mut flight, OK).unwrap();
         sent.push(action_message(SYS_HOME, ""));
@@ -451,11 +568,67 @@ mod tests {
             }
             other => panic!("expected SemanticAction, got {other:?}"),
         }
-        let reply = result_message(OPEN_APP, "inject_failed");
+        let reply = result_message(OPEN_APP, "inject_failed", "");
         match reply.union {
             Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
                 assert_eq!(result.kind, OPEN_APP);
                 assert_eq!(result.code, INJECT_FAILED);
+            }
+            other => panic!("expected SemanticActionResult, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn open_app_and_list_apps_fail_loud() {
+        let ready = desktop("Android");
+        for code in [NOT_INSTALLED, NO_PERMISSION, TIMED_OUT, CAP_EXCEEDED] {
+            assert_eq!(normalize_peer_code(code), code, "{code}");
+            assert!(!is_peer_success(code), "{code}");
+            assert!(code.len() <= 32, "{code}");
+        }
+
+        let page = "v1\t0\t1\t1\t0\nSettings\tcom.android.settings\n";
+        let ok = PeerOutcome::from_jni(&format!("ok\n{page}"));
+        assert_eq!(ok.code, OK);
+        assert_eq!(ok.detail, page);
+
+        let huge = "x".repeat(LIST_APPS_DETAIL_MAX + 1);
+        let refused = PeerOutcome::accept(OK, &huge);
+        assert_eq!(refused.code, CAP_EXCEEDED);
+        assert!(refused.detail.is_empty());
+
+        let hidden = PeerOutcome::from_jni(&format!("{NOT_INSTALLED}\ncom.hidden"));
+        assert_eq!(hidden.code, NOT_INSTALLED);
+        assert!(hidden.detail.is_empty());
+
+        let unknown = PeerOutcome::from_jni(&format!("{}\n{page}", "y".repeat(33)));
+        assert_eq!(unknown.code, INJECT_FAILED);
+        assert!(unknown.detail.is_empty());
+
+        let mut flight = Flight::default();
+        prepare_send(&mut flight, gate(&ready, OPEN_APP, "com.android.settings")).unwrap();
+        assert_eq!(
+            prepare_send(&mut flight, gate(&ready, LIST_APPS, "")),
+            Err(IN_FLIGHT)
+        );
+        flight.finish(NOT_INSTALLED, page);
+        assert_eq!(flight.result(), NOT_INSTALLED);
+        assert!(flight.detail().is_empty());
+        assert!(!is_peer_success(flight.result()));
+
+        prepare_send(&mut flight, OK).unwrap();
+        flight.finish(OK, page);
+        assert!(is_peer_success(flight.result()));
+        assert_eq!(flight.detail(), page);
+
+        let msg = result_message(LIST_APPS, OK, page);
+        let bytes = msg.write_to_bytes().unwrap();
+        let parsed = Message::parse_from_bytes(&bytes).unwrap();
+        match parsed.union {
+            Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
+                assert_eq!(result.kind, LIST_APPS);
+                assert_eq!(result.code, OK);
+                assert_eq!(result.detail, page);
             }
             other => panic!("expected SemanticActionResult, got {other:?}"),
         }

@@ -25,7 +25,7 @@
             <action android:name="android.support.customtabs.action.CustomTabsService" />
         </intent>
         <intent>
-            <!-- open_app resolves a launcher activity by package, not by icon coordinates. -->
+            <!-- open_app and list_apps use MAIN/LAUNCHER. No QUERY_ALL_PACKAGES. -->
             <action android:name="android.intent.action.MAIN" />
             <category android:name="android.intent.category.LAUNCHER" />
         </intent>

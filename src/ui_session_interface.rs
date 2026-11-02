@@ -971,12 +971,17 @@ impl<T: InvokeUiSession> Session<T> {
         self.semantic_flight.lock().unwrap().result().to_owned()
     }
 
-    pub fn note_semantic_result(&self, kind: &str, code: &str) {
+    /// `list_apps` page after a peer `ok`. Empty for every other completion.
+    pub fn semantic_detail(&self) -> String {
+        self.semantic_flight.lock().unwrap().detail().to_owned()
+    }
+
+    pub fn note_semantic_result(&self, kind: &str, code: &str, detail: &str) {
         if kind.len() > 32 {
             log::error!("semantic result kind is {} bytes", kind.len());
         }
         let mut flight = self.semantic_flight.lock().unwrap();
-        flight.finish(code);
+        flight.finish(code, detail);
         log::debug!("semantic action peer result {}", flight.result());
     }
 
