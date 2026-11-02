@@ -17,12 +17,13 @@ on:
       - "appimage/**"
       - "flatpak/**"
 
-jobs:
-  run-ci:
-    uses: ./.github/workflows/flutter-build.yml
-    with:
-      upload-artifact: false
+# Do not call flutter-build.yml here. Its generate-sbom and
+# publish-signed-update-metadata jobs request contents: write, and this
+# repository's token is only allowed contents: read. That call fails at
+# startup, before GitHub creates any job in this file. Nightly and tag
+# workflows still call flutter-build.yml.
 
+jobs:
   semantic-set-text:
     name: set_text read-back decision
     runs-on: ubuntu-22.04

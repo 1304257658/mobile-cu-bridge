@@ -48,6 +48,10 @@ pub const NOT_INSTALLED: &str = "inject_failed: not_installed";
 pub const NO_PERMISSION: &str = "inject_failed: no_permission";
 pub const TIMED_OUT: &str = "inject_failed: timeout";
 
+/// Hard bound for the connection task waiting on `open_app`. The foreground
+/// poll stops at 2.5s; this also covers a hung accessibility call.
+pub const OPEN_APP_BLOCKING_TIMEOUT_MS: u64 = 5_000;
+
 /// What the controller knows before it tries to enqueue.
 #[derive(Clone, Copy)]
 pub struct Gate<'a> {
@@ -504,5 +508,7 @@ mod tests {
         flight.finish(TIMED_OUT);
         assert_eq!(flight.result(), TIMED_OUT);
         assert!(!is_peer_success(flight.result()));
+        assert!(OPEN_APP_BLOCKING_TIMEOUT_MS > 2_500);
+        assert!(OPEN_APP_BLOCKING_TIMEOUT_MS <= 8_000);
     }
 }

@@ -4137,19 +4137,29 @@ impl Connection {
                     } else if !self.peer_keyboard_enabled() {
                         crate::semantic_action::INJECT_FAILED
                     } else if action.kind == crate::semantic_action::OPEN_APP {
-                        // The peer waits until the package is in front. That
-                        // wait must not sleep this connection task.
+                        // Foreground polling is bounded inside the peer. This
+                        // outer bound also returns if that call never comes back.
                         let kind = action.kind.clone();
                         let arg = action.arg.clone();
-                        match tokio::task::spawn_blocking(move || {
-                            crate::semantic_action::execute_on_peer(&kind, &arg)
-                        })
+                        match timeout(
+                            crate::semantic_action::OPEN_APP_BLOCKING_TIMEOUT_MS,
+                            tokio::task::spawn_blocking(move || {
+                                crate::semantic_action::execute_on_peer(&kind, &arg)
+                            }),
+                        )
                         .await
                         {
-                            Ok(code) => code,
-                            Err(e) => {
+                            Ok(Ok(code)) => code,
+                            Ok(Err(e)) => {
                                 log::error!("semantic open_app wait task failed: {e}");
                                 crate::semantic_action::INJECT_FAILED
+                            }
+                            Err(_) => {
+                                log::error!(
+                                    "semantic open_app exceeded {} ms",
+                                    crate::semantic_action::OPEN_APP_BLOCKING_TIMEOUT_MS
+                                );
+                                crate::semantic_action::TIMED_OUT
                             }
                         }
                     } else {
