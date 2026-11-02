@@ -3,31 +3,31 @@ package com.carriez.flutter_hbb
 /**
  * `open_app` peer-result decisions. No Android types, so the unit test can
  * run without an SDK.
+ *
+ * Codes are `ok`, `unsupported`, `no_launch_intent`, `start_threw`, and
+ * `fg_timeout`. The three failures are not `inject_failed`.
  */
 
 internal const val OPEN_OK = "ok"
 internal const val OPEN_UNSUPPORTED = "unsupported"
-internal const val OPEN_INJECT_FAILED = "inject_failed"
-internal const val OPEN_NOT_INSTALLED = "inject_failed: not_installed"
-internal const val OPEN_NO_PERMISSION = "inject_failed: no_permission"
-internal const val OPEN_TIMEOUT = "inject_failed: timeout"
+internal const val OPEN_NO_LAUNCH_INTENT = "no_launch_intent"
+internal const val OPEN_START_THREW = "start_threw"
+internal const val OPEN_FG_TIMEOUT = "fg_timeout"
 
 internal const val OPEN_APP_TIMEOUT_MS = 2_500L
 internal const val OPEN_APP_POLL_MS = 50L
 
 internal enum class OpenStart {
     STARTED,
-    NOT_INSTALLED,
-    NO_PERMISSION,
-    FAILED,
+    NO_LAUNCH_INTENT,
+    START_THREW,
 }
 
 /** A failed start is never `ok`, even if that package is already in front. */
 internal fun openAppPeerCode(start: OpenStart, sawPackage: Boolean): String = when (start) {
-    OpenStart.NOT_INSTALLED -> OPEN_NOT_INSTALLED
-    OpenStart.NO_PERMISSION -> OPEN_NO_PERMISSION
-    OpenStart.FAILED -> OPEN_INJECT_FAILED
-    OpenStart.STARTED -> if (sawPackage) OPEN_OK else OPEN_TIMEOUT
+    OpenStart.NO_LAUNCH_INTENT -> OPEN_NO_LAUNCH_INTENT
+    OpenStart.START_THREW -> OPEN_START_THREW
+    OpenStart.STARTED -> if (sawPackage) OPEN_OK else OPEN_FG_TIMEOUT
 }
 
 /** Polls the foreground wait may take. An absurd timeout still stops at 64. */

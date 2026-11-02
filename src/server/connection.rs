@@ -4159,7 +4159,7 @@ impl Connection {
                                     "semantic open_app exceeded {} ms",
                                     crate::semantic_action::OPEN_APP_BLOCKING_TIMEOUT_MS
                                 );
-                                crate::semantic_action::TIMED_OUT
+                                crate::semantic_action::FG_TIMEOUT
                             }
                         }
                     } else {
