@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# JUnit 4 for SemanticAppsTest. No Android SDK.
+# JUnit 4 for the open_app peer-result decisions. No Android SDK.
 # Requires java on PATH. Downloads Kotlin 1.9.10, JUnit 4.13.2, and Hamcrest 1.3.
 set -euo pipefail
 

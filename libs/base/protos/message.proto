@@ -994,22 +994,20 @@ message PortForwardWindowUpdate {
 // (accessibility global action, package intent, or the focused field). It is
 // not a key event, a clipboard write, or a pointer event.
 message SemanticAction {
-  // sys.back | sys.home | sys.recents | open_app | ime | set_text | list_apps
+  // sys.back | sys.home | sys.recents | open_app | ime | set_text
   string kind = 1;
   // open_app: package or package/activity. set_text: field text.
-  // ime: show | hide. list_apps: empty or a decimal page offset.
-  // Empty for the sys.* kinds.
+  // ime: show | hide. Empty for the sys.* kinds.
   string arg = 2;
 }
 
-// Peer result for a SemanticAction.
-// code is ok, unsupported, inject_failed, or an allowlisted inject_failed reason.
+// Peer result for a SemanticAction. code is ok, unsupported, inject_failed,
+// or an allowlisted open_app reason: inject_failed: not_installed,
+// inject_failed: no_permission, inject_failed: timeout.
 // no_session is decided on the controller and is never sent by the peer.
-// detail is the list_apps page when code is ok. It is empty otherwise.
 message SemanticActionResult {
   string kind = 1;
   string code = 2;
-  string detail = 3;
 }
 
 // One symmetric message for both directions. `open` only travels controller -> controlled,

@@ -7,7 +7,6 @@ const String semanticSysBack = 'sys.back';
 const String semanticSysHome = 'sys.home';
 const String semanticSysRecents = 'sys.recents';
 const String semanticOpenApp = 'open_app';
-const String semanticListApps = 'list_apps';
 const String semanticIme = 'ime';
 const String semanticSetText = 'set_text';
 
@@ -18,7 +17,6 @@ const List<String> semanticKinds = <String>[
   semanticOpenApp,
   semanticIme,
   semanticSetText,
-  semanticListApps,
 ];
 
 /// Enqueue acknowledgement from `sessionSemanticAction`, and the peer
@@ -35,11 +33,10 @@ const String semanticResultMissing = 'inject_failed: no peer result';
 /// The call is not sent.
 const String semanticInFlight = 'inject_failed: action in flight';
 
-/// Peer `open_app` / `list_apps` failures. Not success.
+/// Peer `open_app` failures. Not success.
 const String semanticNotInstalled = 'inject_failed: not_installed';
 const String semanticNoPermission = 'inject_failed: no_permission';
 const String semanticOpenTimeout = 'inject_failed: timeout';
-const String semanticCapExceeded = 'inject_failed: cap';
 
 /// True only when [peerResult] is the peer completion `ok`.
 ///

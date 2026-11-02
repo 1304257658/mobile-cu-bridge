@@ -2,7 +2,7 @@ import 'package:flutter_hbb/models/semantic_action.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('semantic plane includes list_apps', () {
+  test('semantic plane is the six session actions', () {
     expect(semanticKinds, [
       'sys.back',
       'sys.home',
@@ -10,7 +10,6 @@ void main() {
       'open_app',
       'ime',
       'set_text',
-      'list_apps',
     ]);
     expect(semanticKinds.toSet().length, semanticKinds.length);
   });
@@ -43,7 +42,6 @@ void main() {
       semanticNotInstalled,
       semanticNoPermission,
       semanticOpenTimeout,
-      semanticCapExceeded,
     ]) {
       expect(semanticPeerSuccess(code), isFalse);
       expect(code, contains(semanticInjectFailed));

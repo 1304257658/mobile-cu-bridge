@@ -37,8 +37,8 @@ jobs:
       - name: Run set_text decision unit tests
         run: bash flutter/android/semantic-set-text-test.sh
 
-  semantic-apps:
-    name: open_app and list_apps decisions
+  semantic-open-app:
+    name: open_app foreground decision
     runs-on: ubuntu-22.04
     permissions:
       contents: read
@@ -48,5 +48,5 @@ jobs:
         with:
           persist-credentials: false
 
-      - name: Run open_app and list_apps decision unit tests
+      - name: Run open_app foreground decision unit tests
         run: bash flutter/android/semantic-apps-test.sh

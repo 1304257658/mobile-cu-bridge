@@ -734,18 +734,6 @@ pub fn session_semantic_result(session_id: SessionID) -> SyncReturn<String> {
     SyncReturn(code)
 }
 
-/// `list_apps` page for a peer `ok` from [`session_semantic_result`].
-/// Empty for every other completion, and empty when the session is missing.
-/// This string is not a success signal.
-pub fn session_semantic_detail(session_id: SessionID) -> SyncReturn<String> {
-    let detail = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
-        session.semantic_detail()
-    } else {
-        String::new()
-    };
-    SyncReturn(detail)
-}
-
 // chat_client_mode
 pub fn session_send_chat(session_id: SessionID, text: String) {
     if let Some(session) = sessions::get_session_by_session_id(&session_id) {

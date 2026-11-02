@@ -11,8 +11,6 @@ import android.accessibilityservice.GestureDescription
 import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Intent
-import android.content.pm.PackageManager
-import android.content.pm.ResolveInfo
 import android.graphics.Path
 import android.os.Build
 import android.os.Bundle
@@ -781,8 +779,8 @@ class InputService : AccessibilityService() {
     /**
      * Session semantic shortcut. System keys use global accessibility actions,
      * open_app starts a launcher intent and waits until that package is in
-     * front, list_apps returns one page of launcher activities, and set_text /
-     * ime write the focused field. No pointer gesture and no clipboard write.
+     * front, and set_text / ime write the focused field. No pointer gesture
+     * and no clipboard write.
      */
     fun performSemanticAction(kind: String, arg: String): String {
         return when (kind) {
@@ -790,7 +788,6 @@ class InputService : AccessibilityService() {
             "sys.home" -> globalAction(GLOBAL_ACTION_HOME)
             "sys.recents" -> globalAction(GLOBAL_ACTION_RECENTS)
             "open_app" -> openApp(arg)
-            "list_apps" -> listApps(arg)
             "ime" -> setImeMode(arg)
             "set_text" -> setFocusedText(arg)
             else -> "unsupported"
@@ -914,56 +911,6 @@ class InputService : AccessibilityService() {
             if (Build.VERSION.SDK_INT < 33) w.recycle()
         }
         return found
-    }
-
-    private fun listApps(arg: String): String {
-        val offset = listAppsOffset(arg) ?: return OPEN_UNSUPPORTED
-        val resolved = try {
-            queryLaunchers()
-        } catch (e: SecurityException) {
-            Log.e(logTag, "list_apps permission", e)
-            return OPEN_NO_PERMISSION
-        } catch (e: RuntimeException) {
-            Log.e(logTag, "list_apps query failed", e)
-            return OPEN_INJECT_FAILED
-        }
-        if (resolved.size > LIST_APPS_HARD_CAP) {
-            Log.e(
-                logTag,
-                "list_apps refused: ${resolved.size} launcher activities exceeds $LIST_APPS_HARD_CAP",
-            )
-            return OPEN_CAP
-        }
-        val items = ArrayList<LaunchableApp>(resolved.size)
-        var labelFailures = 0
-        for (info in resolved) {
-            val pkg = info.activityInfo?.packageName ?: ""
-            val label = try {
-                info.loadLabel(packageManager)?.toString() ?: ""
-            } catch (_: RuntimeException) {
-                labelFailures += 1
-                ""
-            }
-            items.add(LaunchableApp(label, pkg))
-        }
-        if (labelFailures > 0) {
-            Log.e(logTag, "list_apps label read failed for $labelFailures activities")
-        }
-        val reply = listAppsPage(items, offset)
-        if (reply.code != OPEN_OK) {
-            Log.e(logTag, "list_apps -> ${reply.code}")
-        }
-        return reply.wire()
-    }
-
-    private fun queryLaunchers(): List<ResolveInfo> {
-        val intent = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
-        return if (Build.VERSION.SDK_INT >= 33) {
-            packageManager.queryIntentActivities(intent, PackageManager.ResolveInfoFlags.of(0L))
-        } else {
-            @Suppress("DEPRECATION")
-            packageManager.queryIntentActivities(intent, 0)
-        }
     }
 
     private fun setFocusedText(text: String): String {
