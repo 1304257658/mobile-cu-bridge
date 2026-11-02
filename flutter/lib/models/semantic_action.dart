@@ -33,10 +33,10 @@ const String semanticResultMissing = 'inject_failed: no peer result';
 /// The call is not sent.
 const String semanticInFlight = 'inject_failed: action in flight';
 
-/// Peer `open_app` failures. Not success.
-const String semanticNotInstalled = 'inject_failed: not_installed';
-const String semanticNoPermission = 'inject_failed: no_permission';
-const String semanticOpenTimeout = 'inject_failed: timeout';
+/// Peer `open_app` failures. Not success, and not [semanticInjectFailed].
+const String semanticNoLaunchIntent = 'no_launch_intent';
+const String semanticStartThrew = 'start_threw';
+const String semanticFgTimeout = 'fg_timeout';
 
 /// True only when [peerResult] is the peer completion `ok`.
 ///

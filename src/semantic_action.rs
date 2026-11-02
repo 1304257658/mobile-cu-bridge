@@ -42,11 +42,11 @@ pub const IN_FLIGHT: &str = "inject_failed: action in flight";
 pub const SET_TEXT_MAX: usize = 16 * 1024;
 pub const OPEN_APP_MAX: usize = 256;
 
-/// Peer `open_app` failures. Each is at most 32 bytes so [`normalize_peer_code`]
-/// can keep it. Anything else collapses to [`INJECT_FAILED`].
-pub const NOT_INSTALLED: &str = "inject_failed: not_installed";
-pub const NO_PERMISSION: &str = "inject_failed: no_permission";
-pub const TIMED_OUT: &str = "inject_failed: timeout";
+/// Peer `open_app` failures. Passed through unchanged by [`normalize_peer_code`].
+/// Each is at most 32 bytes. They are not [`INJECT_FAILED`].
+pub const NO_LAUNCH_INTENT: &str = "no_launch_intent";
+pub const START_THREW: &str = "start_threw";
+pub const FG_TIMEOUT: &str = "fg_timeout";
 
 /// Hard bound for the connection task waiting on `open_app`. The foreground
 /// poll stops at 2.5s; this also covers a hung accessibility call.
@@ -211,9 +211,9 @@ pub fn normalize_peer_code(code: &str) -> &'static str {
         OK => OK,
         UNSUPPORTED => UNSUPPORTED,
         INJECT_FAILED => INJECT_FAILED,
-        NOT_INSTALLED => NOT_INSTALLED,
-        NO_PERMISSION => NO_PERMISSION,
-        TIMED_OUT => TIMED_OUT,
+        NO_LAUNCH_INTENT => NO_LAUNCH_INTENT,
+        START_THREW => START_THREW,
+        FG_TIMEOUT => FG_TIMEOUT,
         _ => {
             log::warn!("semantic action peer code `{code}` is not a known result");
             INJECT_FAILED
@@ -480,8 +480,10 @@ mod tests {
     #[test]
     fn open_app_failures_stay_explicit_and_share_the_flight() {
         let ready = desktop("Android");
-        for code in [NOT_INSTALLED, NO_PERMISSION, TIMED_OUT] {
+        for code in [NO_LAUNCH_INTENT, START_THREW, FG_TIMEOUT] {
             assert_eq!(normalize_peer_code(code), code, "{code}");
+            assert_ne!(normalize_peer_code(code), INJECT_FAILED, "{code}");
+            assert!(!code.starts_with(INJECT_FAILED), "{code}");
             assert!(!is_peer_success(code), "{code}");
             assert!(code.len() <= 32, "{code}");
             let reply = result_message(OPEN_APP, code);
@@ -500,15 +502,14 @@ mod tests {
             prepare_send(&mut flight, gate(&ready, OPEN_APP, "com.android.settings")),
             Err(IN_FLIGHT)
         );
-        flight.finish(NOT_INSTALLED);
-        assert_eq!(flight.result(), NOT_INSTALLED);
+        flight.finish(NO_LAUNCH_INTENT);
+        assert_eq!(flight.result(), NO_LAUNCH_INTENT);
         assert!(!is_peer_success(flight.result()));
 
         prepare_send(&mut flight, OK).unwrap();
-        flight.finish(TIMED_OUT);
-        assert_eq!(flight.result(), TIMED_OUT);
+        flight.finish(FG_TIMEOUT);
+        assert_eq!(flight.result(), FG_TIMEOUT);
         assert!(!is_peer_success(flight.result()));
-        assert!(OPEN_APP_BLOCKING_TIMEOUT_MS > 2_500);
-        assert!(OPEN_APP_BLOCKING_TIMEOUT_MS <= 8_000);
+        assert_eq!(OPEN_APP_BLOCKING_TIMEOUT_MS, 5_000);
     }
 }

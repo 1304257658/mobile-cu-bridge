@@ -8,7 +8,6 @@ package com.carriez.flutter_hbb
 
 import android.accessibilityservice.AccessibilityService
 import android.accessibilityservice.GestureDescription
-import android.content.ActivityNotFoundException
 import android.content.ComponentName
 import android.content.Intent
 import android.graphics.Path
@@ -32,8 +31,9 @@ import android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTER
 import android.view.inputmethod.EditorInfo
 import androidx.annotation.RequiresApi
 import java.lang.InterruptedException
-import java.lang.SecurityException
 import java.util.*
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 import java.lang.Character
 import kotlin.math.abs
 import kotlin.math.max
@@ -97,6 +97,7 @@ class InputService : AccessibilityService() {
     }
 
     private val logTag = "input service"
+    private val launcherPackagesLogged = AtomicBoolean(false)
     private var leftIsDown = false
     private var touchPath = Path()
     private var stroke: GestureDescription.StrokeDescription? = null
@@ -823,7 +824,7 @@ class InputService : AccessibilityService() {
         val intent = if (slash < 0) {
             packageManager.getLaunchIntentForPackage(pkg)?.apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            } ?: return OPEN_NOT_INSTALLED
+            } ?: return openAppCode(pkg, OpenStart.NO_LAUNCH_INTENT, false)
         } else {
             val activity = spec.substring(slash + 1)
             if (activity.isEmpty()) {
@@ -839,24 +840,57 @@ class InputService : AccessibilityService() {
         val start = try {
             startActivity(intent)
             OpenStart.STARTED
-        } catch (e: SecurityException) {
-            Log.e(logTag, "open_app $pkg permission", e)
-            OpenStart.NO_PERMISSION
-        } catch (e: ActivityNotFoundException) {
-            Log.e(logTag, "open_app $pkg missing", e)
-            OpenStart.NOT_INSTALLED
         } catch (e: RuntimeException) {
-            Log.e(logTag, "open_app $pkg failed", e)
-            OpenStart.FAILED
+            Log.e(logTag, "open_app $pkg start threw", e)
+            OpenStart.START_THREW
         }
         if (start != OpenStart.STARTED) {
-            return openAppPeerCode(start, false)
+            return openAppCode(pkg, start, false)
         }
-        val code = openAppPeerCode(OpenStart.STARTED, waitUntilForeground(pkg))
+        return openAppCode(pkg, OpenStart.STARTED, waitUntilForeground(pkg))
+    }
+
+    private fun openAppCode(pkg: String, start: OpenStart, sawPackage: Boolean): String {
+        val code = openAppPeerCode(start, sawPackage)
         if (code != OPEN_OK) {
             Log.e(logTag, "open_app $pkg -> $code")
         }
         return code
+    }
+
+    // One log of MAIN/LAUNCHER packages when the service connects.
+    // Not an open_app result, and not getInstalledPackages.
+    private fun logInstalledLaunchersOnce() {
+        if (!launcherPackagesLogged.compareAndSet(false, true)) {
+            return
+        }
+        val pm = packageManager
+        thread(name = "open-app-launchers", isDaemon = true) {
+            try {
+                val probe = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                val seen = sortedSetOf<String>()
+                @Suppress("DEPRECATION")
+                val matches = pm.queryIntentActivities(probe, 0)
+                for (info in matches) {
+                    val pkg = info.activityInfo?.packageName ?: continue
+                    if (pkg.isEmpty()) continue
+                    val cls = info.activityInfo?.name.orEmpty()
+                    val label = try {
+                        info.loadLabel(pm)?.toString()?.replace('\n', ' ')?.trim().orEmpty()
+                    } catch (_: RuntimeException) {
+                        ""
+                    }
+                    val line = if (label.isEmpty()) "$pkg $cls".trim() else "$pkg $cls $label"
+                    seen.add(line)
+                }
+                Log.i(logTag, "open_app launchers ${seen.size}")
+                for (line in seen) {
+                    Log.i(logTag, "open_app launcher $line")
+                }
+            } catch (e: RuntimeException) {
+                Log.e(logTag, "open_app launcher list failed", e)
+            }
+        }
     }
 
     private fun waitUntilForeground(pkg: String): Boolean {
@@ -1006,6 +1040,7 @@ class InputService : AccessibilityService() {
         val layout = fakeEditTextForTextStateCalculation?.getLayout()
         Log.d(logTag, "fakeEditTextForTextStateCalculation layout:$layout")
         Log.d(logTag, "onServiceConnected!")
+        logInstalledLaunchersOnce()
     }
 
     override fun onDestroy() {

@@ -1,21 +1,24 @@
 package com.carriez.flutter_hbb
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
 
 class SemanticAppsTest {
     @Test
     fun failedStartIsNotForegroundSuccess() {
-        assertEquals(OPEN_NOT_INSTALLED, openAppPeerCode(OpenStart.NOT_INSTALLED, true))
-        assertEquals(OPEN_NO_PERMISSION, openAppPeerCode(OpenStart.NO_PERMISSION, true))
-        assertEquals(OPEN_INJECT_FAILED, openAppPeerCode(OpenStart.FAILED, false))
+        assertEquals("no_launch_intent", openAppPeerCode(OpenStart.NO_LAUNCH_INTENT, true))
+        assertEquals("start_threw", openAppPeerCode(OpenStart.START_THREW, true))
+        assertFalse(openAppPeerCode(OpenStart.NO_LAUNCH_INTENT, true).startsWith("inject_failed"))
+        assertFalse(openAppPeerCode(OpenStart.START_THREW, false).startsWith("inject_failed"))
     }
 
     @Test
     fun startedWithoutForegroundIsTimeout() {
-        assertEquals(OPEN_TIMEOUT, openAppPeerCode(OpenStart.STARTED, false))
+        assertEquals("fg_timeout", openAppPeerCode(OpenStart.STARTED, false))
         assertEquals(OPEN_OK, openAppPeerCode(OpenStart.STARTED, true))
+        assertFalse(OPEN_FG_TIMEOUT.startsWith("inject_failed"))
     }
 
     @Test
