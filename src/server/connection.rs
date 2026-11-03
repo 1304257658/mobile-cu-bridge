@@ -4132,6 +4132,7 @@ impl Connection {
                     log::warn!("Terminal action received but not supported on this platform");
                 }
                 Some(message::Union::SemanticAction(action)) => {
+                    let mut detail = String::new();
                     let code = if self.is_authed_view_camera_conn() {
                         crate::semantic_action::UNSUPPORTED
                     } else if !self.peer_keyboard_enabled() {
@@ -4162,14 +4163,51 @@ impl Connection {
                                 crate::semantic_action::FG_TIMEOUT
                             }
                         }
+                    } else if action.kind == crate::semantic_action::LIST_APPS {
+                        let arg = action.arg.clone();
+                        let outcome = match timeout(
+                            crate::semantic_action::LIST_APPS_BLOCKING_TIMEOUT_MS,
+                            tokio::task::spawn_blocking(move || {
+                                crate::semantic_action::execute_list_apps_on_peer(&arg)
+                            }),
+                        )
+                        .await
+                        {
+                            Ok(Ok(outcome)) => outcome,
+                            Ok(Err(e)) => {
+                                log::error!("semantic list_apps task failed: {e}");
+                                crate::semantic_action::ListAppsPeer::failed(
+                                    crate::semantic_action::INJECT_FAILED,
+                                )
+                            }
+                            Err(_) => {
+                                log::error!(
+                                    "semantic list_apps exceeded {} ms",
+                                    crate::semantic_action::LIST_APPS_BLOCKING_TIMEOUT_MS
+                                );
+                                crate::semantic_action::ListAppsPeer::failed(
+                                    crate::semantic_action::INJECT_FAILED,
+                                )
+                            }
+                        };
+                        detail = outcome.detail;
+                        outcome.code
                     } else {
                         crate::semantic_action::execute_on_peer(&action.kind, &action.arg)
                     };
                     if code != crate::semantic_action::OK {
                         log::warn!("semantic action {} -> {code}", action.kind);
                     }
-                    self.send(crate::semantic_action::result_message(&action.kind, code))
-                        .await;
+                    let msg = if detail.is_empty() {
+                        crate::semantic_action::result_message(&action.kind, code)
+                    } else {
+                        crate::semantic_action::result_message_with_detail(
+                            &action.kind,
+                            code,
+                            &detail,
+                        )
+                    };
+                    self.send(msg).await;
                     self.update_auto_disconnect_timer();
                 }
                 _ => {}

@@ -560,6 +560,12 @@ class RustdeskImpl {
     return 'inject_failed: no peer result';
   }
 
+  // No list_apps payload on web. The code channel is already a failure.
+  String sessionSemanticDetail(
+      {required UuidValue sessionId, dynamic hint}) {
+    return '';
+  }
+
   Future<void> sessionSendChat(
       {required UuidValue sessionId, required String text, dynamic hint}) {
     return Future(

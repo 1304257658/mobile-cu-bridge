@@ -789,6 +789,7 @@ class InputService : AccessibilityService() {
             "sys.home" -> globalAction(GLOBAL_ACTION_HOME)
             "sys.recents" -> globalAction(GLOBAL_ACTION_RECENTS)
             "open_app" -> openApp(arg)
+            "list_apps" -> listApps(arg)
             "ime" -> setImeMode(arg)
             "set_text" -> setFocusedText(arg)
             else -> "unsupported"
@@ -856,6 +857,41 @@ class InputService : AccessibilityService() {
             Log.e(logTag, "open_app $pkg -> $code")
         }
         return code
+    }
+
+    // MAIN/LAUNCHER only, same probe as the connect-time log. Not
+    // getInstalledPackages. The kept list stops at LIST_APPS_CAP.
+    private fun listApps(arg: String): String {
+        val offset = listAppsOffset(arg) ?: return OPEN_UNSUPPORTED
+        return try {
+            val pm = packageManager
+            val probe = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            @Suppress("DEPRECATION")
+            val matches = pm.queryIntentActivities(probe, 0)
+            var index = 0
+            val page = collectLauncherPage(offset, object : Iterator<LauncherRow> {
+                override fun hasNext(): Boolean = index < matches.size
+                override fun next(): LauncherRow {
+                    val info = matches[index]
+                    index += 1
+                    val pkg = info.activityInfo?.packageName.orEmpty()
+                    val activity = info.activityInfo?.name
+                    val label = try {
+                        info.loadLabel(pm)?.toString()
+                    } catch (_: RuntimeException) {
+                        null
+                    }
+                    return LauncherRow(pkg, label, activity)
+                }
+            })
+            if (page.code != OPEN_OK) {
+                Log.e(logTag, "list_apps -> ${page.code}")
+            }
+            listAppsWire(page)
+        } catch (e: RuntimeException) {
+            Log.e(logTag, "list_apps query failed", e)
+            "inject_failed"
+        }
     }
 
     // One log of MAIN/LAUNCHER packages when the service connects.
