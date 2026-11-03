@@ -13,6 +13,8 @@ import '../../common/widgets/overlay.dart';
 import '../../common/widgets/remote_input.dart';
 import '../../common/widgets/semantic_action_bar.dart';
 import '../../common.dart';
+import '../../e2_smoke_driver.dart'
+    if (dart.library.html) '../../e2_smoke_driver_stub.dart';
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/toolbar.dart';
 import '../../models/model.dart';
@@ -130,6 +132,7 @@ class _RemotePageState extends State<RemotePage>
   Function(bool)? _onEnterOrLeaveImage4Toolbar;
 
   late FFI _ffi;
+  int? _e2SmokeOwner;
   Worker? _waylandKeyboardModeWorker;
   bool _waylandKeyboardModeNormalized = false;
   bool _waylandKeyboardModeNormalizing = false;
@@ -236,6 +239,9 @@ class _RemotePageState extends State<RemotePage>
     });
     if (_ffi.ffiModel.pi.isSet.value) {
       unawaited(_normalizeWaylandKeyboardModeIfNeeded());
+    }
+    if (isLinux) {
+      _e2SmokeOwner = E2SmokeDriver.start(sessionId);
     }
   }
 
@@ -651,6 +657,10 @@ class _RemotePageState extends State<RemotePage>
 
   @override
   Future<void> dispose() async {
+    final smokeOwner = _e2SmokeOwner;
+    if (smokeOwner != null) {
+      E2SmokeDriver.stop(smokeOwner);
+    }
     final closeSession = closeSessionOnDispose.remove(widget.id) ?? true;
 
     // https://github.com/flutter/flutter/issues/64935
