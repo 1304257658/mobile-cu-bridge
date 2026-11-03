@@ -98,7 +98,8 @@ class E2SmokeDriver {
     );
     final deadline = DateTime.now().add(_peerWait);
     var result = bind.sessionSemanticResult(sessionId: sessionId);
-    while (result == semanticResultMissing && DateTime.now().isBefore(deadline)) {
+    while (
+        result == semanticResultMissing && DateTime.now().isBefore(deadline)) {
       await Future<void>.delayed(_pollEvery);
       if (_sessionId != sessionId) return;
       result = bind.sessionSemanticResult(sessionId: sessionId);
