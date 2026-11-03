@@ -17,12 +17,12 @@ const int semanticListAppsPage = 40;
 /// `list_apps` stops after this many launcher items and sets `truncated`.
 const int semanticListAppsCap = 256;
 
+/// Session bar controls. `list_apps` stays off this list.
 const List<String> semanticKinds = <String>[
   semanticSysBack,
   semanticSysHome,
   semanticSysRecents,
   semanticOpenApp,
-  semanticListApps,
   semanticIme,
   semanticSetText,
 ];

@@ -8,7 +8,6 @@ void main() {
       'sys.home',
       'sys.recents',
       'open_app',
-      'list_apps',
       'ime',
       'set_text',
     ]);
