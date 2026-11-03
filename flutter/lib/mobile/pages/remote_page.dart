@@ -18,7 +18,9 @@ import '../../common.dart';
 import '../../common/widgets/overlay.dart';
 import '../../common/widgets/dialog.dart';
 import '../../common/widgets/remote_input.dart';
+import '../../common/widgets/semantic_action_bar.dart';
 import '../../models/input_model.dart';
+import '../../models/semantic_action_bind.dart';
 import '../../models/model.dart';
 import '../../models/platform_model.dart';
 import '../../models/shortcut_model.dart';
@@ -543,7 +545,10 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                 ],
               )),
           body: Obx(
-            () => getRawPointerAndKeyBody(Overlay(
+            () => Column(
+              children: [
+                Expanded(
+                  child: getRawPointerAndKeyBody(Overlay(
               initialEntries: [
                 OverlayEntry(builder: (context) {
                   return Container(
@@ -575,8 +580,15 @@ class _RemotePageState extends State<RemotePage> with WidgetsBindingObserver {
                   );
                 })
               ],
-            )),
-          )),
+                  )),
+                ),
+                if (gFFI.ffiModel.pi.isSet.isTrue &&
+                    gFFI.ffiModel.isPeerAndroid)
+                  SemanticActionBar(port: semanticActionPort(sessionId)),
+              ],
+            ),
+          ),
+      ),
     );
   }
 
