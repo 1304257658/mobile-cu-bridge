@@ -2,16 +2,20 @@ import 'package:flutter_hbb/models/semantic_action.dart';
 import 'package:flutter_test/flutter_test.dart';
 
 void main() {
-  test('semantic plane is the six session actions', () {
+  test('semantic plane is the session actions', () {
     expect(semanticKinds, [
       'sys.back',
       'sys.home',
       'sys.recents',
       'open_app',
+      'list_apps',
       'ime',
       'set_text',
     ]);
     expect(semanticKinds.toSet().length, semanticKinds.length);
+    expect(semanticListApps, 'list_apps');
+    expect(semanticListAppsPage, 40);
+    expect(semanticListAppsCap, 256);
   });
 
   test('failure codes stay no_session unsupported and inject_failed', () {
