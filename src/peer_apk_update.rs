@@ -1,14 +1,14 @@
-//! Check and cover-install the Android peer APK.
+//! Check and cover-install the Android peer APK from this fork's GitHub Releases.
 //!
-//! Discovery matches the desktop updater: a GitHub Release tag URL, then the
-//! signed `rustdesk-update.json` sidecar. The APK itself is HTTPS plus the
-//! sidecar sha256. A bad hash, a bad signature, or a size overrun deletes the
-//! file and does not install.
+//! Discovery is `https://github.com/1304257658/mobile-cu-bridge` only. The sha256
+//! comes from the release `SHA256SUMS` file, checked against the asset digest
+//! when GitHub sends one. `api.rustdesk.com` and `github.com/rustdesk/rustdesk`
+//! are refused.
 //!
-//! The install is a same-certificate replacement. There is no uninstall step,
-//! so the on-disk `enc_id` and device id stay. A different certificate is
-//! `signature`. A device id or `enc_id` that does not match afterwards is
-//! `id_changed`.
+//! Cover-install does not uninstall. The OS kills this process when the
+//! package is replaced, so the in-process path never reports `ok`. The id and
+//! `enc_id` are written to disk first. The next process compares that snapshot
+//! and the controller hears `ok` or `id_changed` when it reconnects.
 
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
@@ -19,7 +19,7 @@ use crate::{
     },
     update_hash::verify_sha256_reader,
 };
-use hbb_common::{get_version_number, log};
+use hbb_common::log;
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
@@ -28,9 +28,10 @@ use std::{
 };
 
 const APK_MAX_BYTES: u64 = 96 * 1024 * 1024;
-const METADATA_MAX_BYTES: u64 = 1024 * 1024;
-const VERSION_BODY_MAX_BYTES: u64 = 64 * 1024;
+const RELEASES_JSON_MAX: u64 = 512 * 1024;
+const SUMS_MAX_BYTES: u64 = 64 * 1024;
 const ID_FILE_MAX_BYTES: u64 = 256 * 1024;
+const SNAPSHOT_MAX_BYTES: u64 = 8 * 1024;
 const ENC_ID_MAX: usize = 4096;
 const DEVICE_ID_MAX: usize = 64;
 const CHUNK: usize = 8192;
@@ -47,7 +48,18 @@ const INNER_BUDGET: Duration = Duration::from_secs(200);
 pub(crate) const BLOCKING_TIMEOUT_MS: u64 = 210_000;
 
 const APK_FILE_NAME: &str = "rustdesk-peer-update.apk";
+const SNAPSHOT_FILE: &str = "peer-update-id-snapshot";
+const VERDICT_FILE: &str = "peer-update-id-verdict";
+const FORK_OWNER: &str = "1304257658";
+const FORK_REPO: &str = "mobile-cu-bridge";
+const RELEASES_API: &str =
+    "https://api.github.com/repos/1304257658/mobile-cu-bridge/releases?per_page=20";
 
+/// Install was handed to the OS. Not a wire result and not `ok`.
+/// The process is expected to die. `ok` / `id_changed` are reported after restart.
+pub(crate) const COMMITTED: &str = "committed";
+
+#[derive(Debug, PartialEq)]
 struct Admitted {
     url: String,
     size: u64,
@@ -108,14 +120,14 @@ pub(crate) fn execute(arg: &str) -> &'static str {
 #[cfg(target_os = "android")]
 fn execute_android(arg: &str) -> &'static str {
     let deadline = Instant::now() + INNER_BUDGET;
-    let release = match resolve_release(arg, deadline) {
-        Ok(Some(url)) => url,
-        Ok(None) => return semantic_action::OK,
-        Err(code) => return code,
+    let Some(dir) = config_dir() else {
+        return UPDATE_INSTALL;
     };
-    let artifact = match load_artifact(&release, deadline) {
-        Ok(Some(artifact)) => artifact,
-        Ok(None) => return semantic_action::OK,
+    if let Some(code) = take_verdict(&dir) {
+        return code;
+    }
+    let artifact = match discover(arg, deadline) {
+        Ok(artifact) => artifact,
         Err(code) => return code,
     };
     let before = match snapshot_id() {
@@ -131,123 +143,81 @@ fn execute_android(arg: &str) -> &'static str {
         deadline,
     );
     let code = if downloaded == semantic_action::OK && remaining(deadline) < INSTALL_TIMEOUT {
+        let _ = remove_snapshot(&dir);
         UPDATE_NETWORK
     } else if downloaded != semantic_action::OK {
+        let _ = remove_snapshot(&dir);
         downloaded
     } else {
         match jni_certs(&dest) {
-            Ok((installed, candidate)) => after_download(
-                downloaded,
-                &installed,
-                &candidate,
-                &before,
-                || jni_cover(&dest),
-                || snapshot_id().unwrap_or_else(|_| IdMaterial::blank()),
-            ),
+            Ok((installed, candidate)) => {
+                if authorize_cover(&installed, &candidate) != semantic_action::OK {
+                    UPDATE_SIGNATURE
+                } else if write_snapshot(&dir, &before).is_err() {
+                    UPDATE_INSTALL
+                } else {
+                    finish_committed_or_fail(&dir, &jni_cover(&dest))
+                }
+            }
             Err(code) => code,
         }
     };
     let _ = remove_regular(&dest);
     let _ = remove_regular(&partial_path(&dest));
-    if code != semantic_action::OK {
+    if code != semantic_action::OK && code != COMMITTED {
         log::error!("peer apk check_update -> {code}");
     }
     code
 }
 
 #[cfg(target_os = "android")]
-fn resolve_release(arg: &str, deadline: Instant) -> Result<Option<String>, &'static str> {
-    if arg.is_empty() {
-        let body = fetch_version(deadline)?;
-        return release_page_from_version_body(&body, crate::VERSION);
-    }
-    explicit_release(arg)
-}
-
-#[cfg(target_os = "android")]
-fn explicit_release(arg: &str) -> Result<Option<String>, &'static str> {
-    let release_id =
-        crate::common::release_id_from_update_url(arg).map_err(|_| semantic_action::UNSUPPORTED)?;
-    let display = crate::common::display_version_from_release_id(&release_id)
-        .map_err(|_| semantic_action::UNSUPPORTED)?;
-    if get_version_number(&display) <= get_version_number(crate::VERSION) {
-        Ok(None)
-    } else {
-        Ok(Some(arg.to_owned()))
-    }
-}
-
-#[cfg(target_os = "android")]
-fn fetch_version(deadline: Instant) -> Result<Vec<u8>, &'static str> {
-    let (request, url) =
-        hbb_common::version_check_request(hbb_common::VER_TYPE_RUSTDESK_CLIENT.to_owned());
-    let client = create_http_client_with_url_strict(&url).map_err(|e| {
-        log::error!("peer apk version client: {e}");
-        UPDATE_NETWORK
-    })?;
-    let timeout = remaining(deadline).min(VERSION_TIMEOUT);
-    if timeout.is_zero() {
-        return Err(UPDATE_NETWORK);
-    }
-    let response = client
-        .post(&url)
-        .timeout(timeout)
-        .json(&request)
-        .send()
-        .map_err(|e| {
-            log::error!("peer apk version check: {e}");
-            UPDATE_NETWORK
-        })?;
-    read_http(response, VERSION_BODY_MAX_BYTES, deadline)
-}
-
-#[cfg(target_os = "android")]
-fn load_artifact(release_page: &str, deadline: Instant) -> Result<Option<Admitted>, &'static str> {
-    let release_id =
-        crate::common::release_id_from_update_url(release_page).map_err(|_| UPDATE_NETWORK)?;
-    let display =
-        crate::common::display_version_from_release_id(&release_id).map_err(|_| UPDATE_NETWORK)?;
+fn discover(arg: &str, deadline: Instant) -> Result<Admitted, &'static str> {
     let arch = android_update_arch();
     if arch == "unknown" {
         return Err(semantic_action::UNSUPPORTED);
     }
-    let prefix = format!("https://github.com/rustdesk/rustdesk/releases/download/{release_id}/");
-    let metadata_url = format!("{prefix}rustdesk-update.json");
-    let signature_url = format!("{metadata_url}.sig");
-    let metadata = fetch_limited(&metadata_url, METADATA_MAX_BYTES, deadline)?;
-    let signature = fetch_limited(&signature_url, METADATA_MAX_BYTES, deadline)?;
-    let requirements = crate::update_metadata::UpdateMetadataRequirements {
-        expected_version: display.as_str(),
-        expected_release_id: release_id.as_str(),
-        expected_artifact_url_prefix: prefix.as_str(),
-        artifact: crate::update_metadata::UpdateArtifactQuery {
-            platform: "android",
-            arch,
-            format: "apk",
-        },
-    };
-    match crate::update_metadata::verify_update_metadata(&metadata, &signature, requirements) {
-        Ok(artifact) => {
-            admit_apk_artifact(&artifact.url, artifact.size, &artifact.sha256)?;
-            if get_version_number(&artifact.version) <= get_version_number(crate::VERSION) {
-                return Ok(None);
-            }
-            Ok(Some(Admitted {
-                url: artifact.url,
-                size: artifact.size,
-                sha256: artifact.sha256,
-            }))
+    let (only_tag, only_name) = if arg.is_empty() {
+        (None, None)
+    } else {
+        match fork_release_ref(arg) {
+            Some(ForkRef::Tag(tag)) => (Some(tag), None),
+            Some(ForkRef::Asset { tag, name }) => (Some(tag), Some(name)),
+            None => return Err(semantic_action::UNSUPPORTED),
         }
-        Err(e) => {
-            log::error!("peer apk metadata rejected: {e}");
-            Err(classify_metadata(&e.to_string()))
+    };
+    if let Some(tag) = only_tag.as_deref() {
+        if device_tag_arch(tag) != Some(arch) {
+            return Err(semantic_action::UNSUPPORTED);
         }
     }
+    let url = match only_tag.as_deref() {
+        None => RELEASES_API.to_owned(),
+        Some(tag) => {
+            format!("https://api.github.com/repos/{FORK_OWNER}/{FORK_REPO}/releases/tags/{tag}")
+        }
+    };
+    let body = fetch_limited(&url, RELEASES_JSON_MAX, deadline)?;
+    let choice = choose_release(&body, arch, only_tag.as_deref(), only_name.as_deref())?;
+    let sums = if choice.has_sums {
+        let sums_url = format!(
+            "https://github.com/{FORK_OWNER}/{FORK_REPO}/releases/download/{}/SHA256SUMS",
+            choice.tag
+        );
+        Some(fetch_limited(&sums_url, SUMS_MAX_BYTES, deadline)?)
+    } else {
+        None
+    };
+    let sums_text = match sums.as_deref() {
+        Some(bytes) => Some(std::str::from_utf8(bytes).map_err(|_| UPDATE_CHECKSUM)?),
+        None => None,
+    };
+    lock_sha(&choice, sums_text)
 }
 
 #[cfg(target_os = "android")]
 fn fetch_limited(url: &str, max: u64, deadline: Instant) -> Result<Vec<u8>, &'static str> {
-    if max > METADATA_MAX_BYTES {
+    if banned_upstream(url) || !fork_fetch_url(url) || max == 0 || max > RELEASES_JSON_MAX {
+        log::error!("peer apk refused fetch url");
         return Err(UPDATE_CHECKSUM);
     }
     let client = create_http_client_with_url_strict(url).map_err(|e| {
@@ -258,10 +228,16 @@ fn fetch_limited(url: &str, max: u64, deadline: Instant) -> Result<Vec<u8>, &'st
     if timeout.is_zero() {
         return Err(UPDATE_NETWORK);
     }
-    let response = client.get(url).timeout(timeout).send().map_err(|e| {
-        log::error!("peer apk sidecar: {e}");
-        UPDATE_NETWORK
-    })?;
+    let response = client
+        .get(url)
+        .header(reqwest::header::USER_AGENT, "mobile-cu-bridge")
+        .header(reqwest::header::ACCEPT, "application/vnd.github+json")
+        .timeout(timeout)
+        .send()
+        .map_err(|e| {
+            log::error!("peer apk sidecar: {e}");
+            UPDATE_NETWORK
+        })?;
     read_http(response, max, deadline)
 }
 
@@ -374,6 +350,7 @@ fn jni_cover(path: &Path) -> &'static str {
         return UPDATE_INSTALL;
     };
     match scrap::android::call_main_service_peer_apk_cover_install(&path) {
+        Ok(code) if code.trim() == "committed" => "committed",
         Ok(code) => known_update_code(&code),
         Err(e) => {
             log::error!("peer apk install jni: {e}");
@@ -392,8 +369,8 @@ fn path_str(path: &Path) -> Result<String, &'static str> {
 
 fn android_update_arch() -> &'static str {
     match std::env::consts::ARCH {
-        "aarch64" => "aarch64",
-        "arm" => "armv7",
+        "aarch64" => "arm64",
+        "arm" => "arm",
         "x86_64" => "x86_64",
         "x86" => "x86",
         _ => "unknown",
@@ -404,30 +381,6 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-/// `Ok(None)` means this release is not newer than `current_version`.
-fn release_page_from_version_body(
-    bytes: &[u8],
-    current_version: &str,
-) -> Result<Option<String>, &'static str> {
-    if bytes.len() as u64 > VERSION_BODY_MAX_BYTES {
-        return Err(UPDATE_CHECKSUM);
-    }
-    let resp: hbb_common::VersionCheckResponse =
-        serde_json::from_slice(bytes).map_err(|_| UPDATE_NETWORK)?;
-    if resp.url.is_empty() {
-        return Err(UPDATE_NETWORK);
-    }
-    let release_id =
-        crate::common::release_id_from_update_url(&resp.url).map_err(|_| UPDATE_NETWORK)?;
-    let display =
-        crate::common::display_version_from_release_id(&release_id).map_err(|_| UPDATE_NETWORK)?;
-    if get_version_number(&display) > get_version_number(current_version) {
-        Ok(Some(resp.url))
-    } else {
-        Ok(None)
-    }
-}
-
 fn admit_apk_artifact(url: &str, size: u64, sha256: &str) -> Result<(), &'static str> {
     if size == 0 || size > APK_MAX_BYTES || !sha256_hex(sha256) || !github_release_apk_url(url) {
         return Err(UPDATE_CHECKSUM);
@@ -435,24 +388,65 @@ fn admit_apk_artifact(url: &str, size: u64, sha256: &str) -> Result<(), &'static
     Ok(())
 }
 
-fn classify_metadata(msg: &str) -> &'static str {
-    let msg = msg.to_ascii_lowercase();
-    if msg.contains("signature") {
-        UPDATE_SIGNATURE
-    } else if msg.contains("not found") || msg.contains("multiple matching") {
-        semantic_action::UNSUPPORTED
-    } else {
-        UPDATE_CHECKSUM
+fn github_release_apk_url(url: &str) -> bool {
+    if banned_upstream(url) {
+        return false;
+    }
+    match fork_release_ref(url) {
+        Some(ForkRef::Asset { tag, name }) => {
+            device_tag_arch(&tag).is_some() && plain_apk_name(&name)
+        }
+        _ => false,
     }
 }
 
-fn github_release_apk_url(url: &str) -> bool {
-    if !url.starts_with("https://github.com/") {
-        return false;
+pub(crate) fn release_tag_arg_ok(arg: &str) -> bool {
+    match fork_release_ref(arg) {
+        Some(ForkRef::Tag(tag) | ForkRef::Asset { tag, .. }) => device_tag_arch(&tag).is_some(),
+        None => false,
     }
+}
+
+fn banned_upstream(url: &str) -> bool {
+    let url = url.to_ascii_lowercase();
+    url.contains("://api.rustdesk.com")
+        || url.contains("://github.com/rustdesk/")
+        || url.contains("://www.github.com/rustdesk/")
+}
+
+fn fork_fetch_url(url: &str) -> bool {
     let Ok(parsed) = url::Url::parse(url) else {
         return false;
     };
+    if parsed.scheme() != "https"
+        || !parsed.username().is_empty()
+        || parsed.password().is_some()
+        || parsed.port().is_some()
+        || parsed
+            .query()
+            .map(|q| q.contains("rustdesk.com"))
+            .unwrap_or(false)
+    {
+        return false;
+    }
+    let host = parsed.host_str().unwrap_or("");
+    let path = parsed.path();
+    let prefix = format!("/repos/{FORK_OWNER}/{FORK_REPO}/releases");
+    let download = format!("/{FORK_OWNER}/{FORK_REPO}/releases/download/");
+    (host == "api.github.com" && path.starts_with(&prefix))
+        || (host == "github.com" && path.starts_with(&download))
+}
+
+enum ForkRef {
+    Tag(String),
+    Asset { tag: String, name: String },
+}
+
+fn fork_release_ref(url: &str) -> Option<ForkRef> {
+    if banned_upstream(url) || !url.starts_with("https://github.com/") {
+        return None;
+    }
+    let parsed = url::Url::parse(url).ok()?;
     if parsed.scheme() != "https"
         || parsed.host_str() != Some("github.com")
         || !parsed.username().is_empty()
@@ -461,29 +455,434 @@ fn github_release_apk_url(url: &str) -> bool {
         || parsed.query().is_some()
         || parsed.fragment().is_some()
     {
-        return false;
+        return None;
     }
-    let Some(mut segments) = parsed.path_segments() else {
-        return false;
+    let mut segments = parsed.path_segments()?;
+    if segments.next()? != FORK_OWNER
+        || segments.next()? != FORK_REPO
+        || segments.next()? != "releases"
+    {
+        return None;
+    }
+    match segments.next()? {
+        "tag" => {
+            let tag = segments.next()?;
+            if segments.next().is_some() || device_tag_arch(tag).is_none() {
+                return None;
+            }
+            Some(ForkRef::Tag(tag.to_owned()))
+        }
+        "download" => {
+            let tag = segments.next()?;
+            let name = segments.next()?;
+            if segments.next().is_some() || !plain_apk_name(name) || device_tag_arch(tag).is_none()
+            {
+                return None;
+            }
+            Some(ForkRef::Asset {
+                tag: tag.to_owned(),
+                name: name.to_owned(),
+            })
+        }
+        _ => None,
+    }
+}
+
+fn device_tag_arch(tag: &str) -> Option<&str> {
+    let rest = tag.strip_prefix("device-")?;
+    let (mid, date) = rest.rsplit_once('-')?;
+    if date.len() != 8 || !date.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
+    let (name, arch) = mid.rsplit_once('-')?;
+    if name.is_empty() || !token_ok(name) || !matches!(arch, "arm64" | "arm" | "x86_64" | "x86") {
+        return None;
+    }
+    Some(arch)
+}
+
+fn token_ok(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 180
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+}
+
+#[derive(Debug, PartialEq)]
+struct ReleaseChoice {
+    tag: String,
+    name: String,
+    size: u64,
+    digest_sha: Option<String>,
+    has_sums: bool,
+}
+
+fn choose_release(
+    bytes: &[u8],
+    arch: &str,
+    only_tag: Option<&str>,
+    only_name: Option<&str>,
+) -> Result<ReleaseChoice, &'static str> {
+    if bytes.len() as u64 > RELEASES_JSON_MAX {
+        return Err(UPDATE_CHECKSUM);
+    }
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|_| UPDATE_NETWORK)?;
+    let list: Vec<&serde_json::Value> = if let Some(items) = value.as_array() {
+        items.iter().collect()
+    } else if value.is_object() {
+        vec![&value]
+    } else {
+        return Err(UPDATE_NETWORK);
     };
-    let owner = segments.next();
-    let repo = segments.next();
-    let releases = segments.next();
-    let download = segments.next();
-    let tag = segments.next();
-    let filename = segments.next();
-    matches!(
-        (owner, repo, releases, download, tag, filename, segments.next()),
-        (
-            Some("rustdesk"),
-            Some("rustdesk"),
-            Some("releases"),
-            Some("download"),
-            Some(tag),
-            Some(filename),
-            None
-        ) if !tag.is_empty() && plain_apk_name(filename)
-    )
+    if list.len() > 20 {
+        return Err(UPDATE_CHECKSUM);
+    }
+    for item in list {
+        if let Some(choice) = release_choice(item, arch, only_tag, only_name)? {
+            return Ok(choice);
+        }
+    }
+    Err(semantic_action::UNSUPPORTED)
+}
+
+fn release_choice(
+    item: &serde_json::Value,
+    arch: &str,
+    only_tag: Option<&str>,
+    only_name: Option<&str>,
+) -> Result<Option<ReleaseChoice>, &'static str> {
+    let tag = item.get("tag_name").and_then(|v| v.as_str()).unwrap_or("");
+    if device_tag_arch(tag) != Some(arch) {
+        return Ok(None);
+    }
+    if let Some(want) = only_tag {
+        if tag != want {
+            return Ok(None);
+        }
+    }
+    let assets = item
+        .get("assets")
+        .and_then(|v| v.as_array())
+        .ok_or(UPDATE_NETWORK)?;
+    if assets.len() > 32 {
+        return Err(UPDATE_CHECKSUM);
+    }
+    let mut apk = None;
+    let mut has_sums = false;
+    for asset in assets {
+        let name = asset.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        if name == "SHA256SUMS" {
+            has_sums = true;
+            continue;
+        }
+        if !plain_apk_name(name) {
+            continue;
+        }
+        if apk.is_some() {
+            return Err(UPDATE_CHECKSUM);
+        }
+        let size = asset.get("size").and_then(|v| v.as_u64()).unwrap_or(0);
+        let digest = asset.get("digest").and_then(|v| v.as_str()).unwrap_or("");
+        apk = Some((name.to_owned(), size, digest.to_owned()));
+    }
+    let Some((name, size, digest)) = apk else {
+        return Ok(None);
+    };
+    if let Some(want) = only_name {
+        if name != want {
+            return Err(UPDATE_CHECKSUM);
+        }
+    }
+    if size == 0 || size > APK_MAX_BYTES {
+        return Err(UPDATE_CHECKSUM);
+    }
+    Ok(Some(ReleaseChoice {
+        tag: tag.to_owned(),
+        name,
+        size,
+        digest_sha: digest_sha(&digest),
+        has_sums,
+    }))
+}
+
+fn digest_sha(digest: &str) -> Option<String> {
+    let rest = digest
+        .strip_prefix("sha256:")
+        .or_else(|| digest.strip_prefix("SHA256:"))?;
+    if sha256_hex(rest) {
+        Some(rest.to_ascii_lowercase())
+    } else {
+        None
+    }
+}
+
+fn lock_sha(choice: &ReleaseChoice, sums_text: Option<&str>) -> Result<Admitted, &'static str> {
+    let url = format!(
+        "https://github.com/{FORK_OWNER}/{FORK_REPO}/releases/download/{}/{}",
+        choice.tag, choice.name
+    );
+    let sha = if choice.has_sums {
+        let text = sums_text.ok_or(UPDATE_NETWORK)?;
+        if text.len() as u64 > SUMS_MAX_BYTES {
+            return Err(UPDATE_CHECKSUM);
+        }
+        let from_sums = sha_from_sums(text, &choice.name)?;
+        if let Some(digest) = &choice.digest_sha {
+            if !digest.eq_ignore_ascii_case(&from_sums) {
+                return Err(UPDATE_CHECKSUM);
+            }
+        }
+        from_sums
+    } else if let Some(digest) = &choice.digest_sha {
+        digest.clone()
+    } else {
+        return Err(UPDATE_CHECKSUM);
+    };
+    admit_apk_artifact(&url, choice.size, &sha)?;
+    Ok(Admitted {
+        url,
+        size: choice.size,
+        sha256: sha,
+    })
+}
+
+fn sha_from_sums(text: &str, filename: &str) -> Result<String, &'static str> {
+    let mut found = None;
+    for line in text.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let mut parts = line.split_whitespace();
+        let Some(sha) = parts.next() else {
+            continue;
+        };
+        let Some(name) = parts.next() else {
+            return Err(UPDATE_CHECKSUM);
+        };
+        if parts.next().is_some() {
+            return Err(UPDATE_CHECKSUM);
+        }
+        if name != filename {
+            continue;
+        }
+        if !sha256_hex(sha) {
+            return Err(UPDATE_CHECKSUM);
+        }
+        let sha = sha.to_ascii_lowercase();
+        if let Some(prev) = &found {
+            if prev != &sha {
+                return Err(UPDATE_CHECKSUM);
+            }
+        }
+        found = Some(sha);
+    }
+    found.ok_or(UPDATE_CHECKSUM)
+}
+
+fn finish_committed_or_fail(dir: &Path, cover_code: &str) -> &'static str {
+    // A commit that the OS accepts kills this process. Never report ok here.
+    if cover_code == "committed" || cover_code == semantic_action::OK {
+        return COMMITTED;
+    }
+    let _ = remove_snapshot(dir);
+    let code = known_update_code(cover_code);
+    if code == semantic_action::OK {
+        COMMITTED
+    } else {
+        code
+    }
+}
+
+fn write_snapshot(dir: &Path, id: &IdMaterial) -> Result<(), &'static str> {
+    let _ = remove_regular(&verdict_path(dir));
+    if id.device_id.is_empty()
+        || id.device_id.len() > DEVICE_ID_MAX
+        || id.enc_id.len() > ENC_ID_MAX
+        || id.plain_id.len() > DEVICE_ID_MAX
+        || field_has_break(&id.device_id)
+        || field_has_break(&id.enc_id)
+        || field_has_break(&id.plain_id)
+    {
+        return Err(UPDATE_INSTALL);
+    }
+    let body = format!("v1\n{}\n{}\n{}\n", id.device_id, id.enc_id, id.plain_id);
+    if body.len() as u64 > SNAPSHOT_MAX_BYTES {
+        return Err(UPDATE_INSTALL);
+    }
+    write_regular(&snap_path(dir), body.as_bytes())
+}
+
+fn settle_dir(dir: &Path) -> Result<Option<&'static str>, &'static str> {
+    let Some(before) = read_snapshot(dir)? else {
+        return Ok(None);
+    };
+    let code = match read_capped(&config_file(dir), ID_FILE_MAX_BYTES) {
+        Ok(bytes) => id_preserved_on_disk(&before, &bytes),
+        Err(_) => UPDATE_ID_CHANGED,
+    };
+    let _ = remove_snapshot(dir);
+    write_regular(&verdict_path(dir), code.as_bytes())?;
+    Ok(Some(code))
+}
+
+fn id_preserved_on_disk(before: &IdMaterial, file: &[u8]) -> &'static str {
+    if before.device_id.is_empty() || file.len() as u64 > ID_FILE_MAX_BYTES {
+        return UPDATE_ID_CHANGED;
+    }
+    let enc = toml_field(file, "enc_id").unwrap_or_default();
+    let plain = toml_field(file, "id").unwrap_or_default();
+    if !before.enc_id.is_empty() {
+        return if enc == before.enc_id {
+            semantic_action::OK
+        } else {
+            UPDATE_ID_CHANGED
+        };
+    }
+    if plain == before.device_id {
+        semantic_action::OK
+    } else {
+        UPDATE_ID_CHANGED
+    }
+}
+
+fn read_snapshot(dir: &Path) -> Result<Option<IdMaterial>, &'static str> {
+    let path = snap_path(dir);
+    match read_capped(&path, SNAPSHOT_MAX_BYTES) {
+        Err(_) if !path.exists() => Ok(None),
+        Err(_) => {
+            let _ = remove_snapshot(dir);
+            write_regular(&verdict_path(dir), UPDATE_ID_CHANGED.as_bytes())?;
+            Ok(None)
+        }
+        Ok(bytes) => match parse_snapshot(&bytes) {
+            Some(id) => Ok(Some(id)),
+            None => {
+                let _ = remove_snapshot(dir);
+                write_regular(&verdict_path(dir), UPDATE_ID_CHANGED.as_bytes())?;
+                Ok(None)
+            }
+        },
+    }
+}
+
+fn parse_snapshot(bytes: &[u8]) -> Option<IdMaterial> {
+    if bytes.len() as u64 > SNAPSHOT_MAX_BYTES {
+        return None;
+    }
+    let text = std::str::from_utf8(bytes).ok()?;
+    let mut lines = text.lines();
+    if lines.next()? != "v1" {
+        return None;
+    }
+    let device_id = lines.next()?.to_owned();
+    let enc_id = lines.next()?.to_owned();
+    let plain_id = lines.next()?.to_owned();
+    if lines.next().is_some()
+        || device_id.is_empty()
+        || device_id.len() > DEVICE_ID_MAX
+        || enc_id.len() > ENC_ID_MAX
+        || plain_id.len() > DEVICE_ID_MAX
+    {
+        return None;
+    }
+    Some(IdMaterial {
+        device_id,
+        enc_id,
+        plain_id,
+    })
+}
+
+fn peek_verdict(dir: &Path) -> Option<&'static str> {
+    let bytes = read_capped(&verdict_path(dir), 64).ok()?;
+    match std::str::from_utf8(&bytes).ok()?.trim() {
+        semantic_action::OK => Some(semantic_action::OK),
+        _ => Some(UPDATE_ID_CHANGED),
+    }
+}
+
+fn take_verdict(dir: &Path) -> Option<&'static str> {
+    let code = peek_verdict(dir)?;
+    let _ = remove_regular(&verdict_path(dir));
+    Some(code)
+}
+
+fn field_has_break(value: &str) -> bool {
+    value.chars().any(|c| c == '\n' || c == '\r')
+}
+
+fn snap_path(dir: &Path) -> PathBuf {
+    dir.join(SNAPSHOT_FILE)
+}
+
+fn verdict_path(dir: &Path) -> PathBuf {
+    dir.join(VERDICT_FILE)
+}
+
+fn config_file(dir: &Path) -> PathBuf {
+    dir.join("RustDesk.toml")
+}
+
+fn write_regular(path: &Path, bytes: &[u8]) -> Result<(), &'static str> {
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| UPDATE_INSTALL)?;
+    }
+    if let Ok(meta) = std::fs::symlink_metadata(path) {
+        if !meta.file_type().is_file() {
+            return Err(UPDATE_INSTALL);
+        }
+        std::fs::remove_file(path).map_err(|_| UPDATE_INSTALL)?;
+    }
+    let mut file = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map_err(|_| UPDATE_INSTALL)?;
+    file.write_all(bytes).map_err(|_| UPDATE_INSTALL)?;
+    file.flush().map_err(|_| UPDATE_INSTALL)?;
+    Ok(())
+}
+
+fn remove_snapshot(dir: &Path) -> Result<(), ()> {
+    remove_regular(&snap_path(dir))
+}
+
+#[cfg(target_os = "android")]
+fn config_dir() -> Option<PathBuf> {
+    hbb_common::config::Config::file()
+        .parent()
+        .map(|p| p.to_path_buf())
+}
+
+pub(crate) fn settle_persisted_snapshot() {
+    #[cfg(target_os = "android")]
+    {
+        let Some(dir) = config_dir() else {
+            return;
+        };
+        match settle_dir(&dir) {
+            Ok(Some(code)) => log::info!("peer apk post-replace -> {code}"),
+            Ok(None) => {}
+            Err(code) => log::error!("peer apk post-replace -> {code}"),
+        }
+    }
+}
+
+pub(crate) fn reconnect_result() -> Option<base::message_proto::Message> {
+    #[cfg(not(target_os = "android"))]
+    {
+        None
+    }
+    #[cfg(target_os = "android")]
+    {
+        let dir = config_dir()?;
+        let code = peek_verdict(&dir)?;
+        Some(semantic_action::result_message(
+            semantic_action::CHECK_UPDATE,
+            code,
+        ))
+    }
 }
 
 fn plain_apk_name(filename: &str) -> bool {
@@ -898,8 +1297,8 @@ mod tests {
     use std::io::Cursor;
 
     const SHA_RUSTDESK: &str = "304ca1638c5effa6832e0e15b958a8f74847efe4df9c3f3187216e921c168fed";
-    const RELEASE_APK: &str =
-        "https://github.com/rustdesk/rustdesk/releases/download/1.4.6/rustdesk-1.4.6-aarch64.apk";
+    const RELEASE_APK: &str = "https://github.com/1304257658/mobile-cu-bridge/releases/download/device-e1e2e5e8e912-arm64-20261103/mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk";
+    const DEVICE_SHA: &str = "9b235b5e831ab748f790ca1a6d18b02084ee9d59fe96fdd2c73105f73cc14d17";
 
     struct PanicRead;
 
@@ -942,16 +1341,30 @@ mod tests {
         );
         assert_eq!(
             admit_apk_artifact(
-                "http://github.com/rustdesk/rustdesk/releases/download/1.4.6/a.apk",
+                "https://github.com/rustdesk/rustdesk/releases/download/1.4.6/a.apk",
                 8,
                 SHA_RUSTDESK
             ),
             Err(UPDATE_CHECKSUM)
         );
         assert_eq!(
+            admit_apk_artifact("https://api.rustdesk.com/version/latest", 8, SHA_RUSTDESK),
+            Err(UPDATE_CHECKSUM)
+        );
+        assert_eq!(
             admit_apk_artifact("https://example.com/a.apk", 8, SHA_RUSTDESK),
             Err(UPDATE_CHECKSUM)
         );
+        assert!(!release_tag_arg_ok(
+            "https://github.com/rustdesk/rustdesk/releases/tag/1.4.6"
+        ));
+        assert!(!release_tag_arg_ok(
+            "https://api.rustdesk.com/version/latest"
+        ));
+        assert!(release_tag_arg_ok(
+            "https://github.com/1304257658/mobile-cu-bridge/releases/tag/device-e1e2e5e8e912-arm64-20261103"
+        ));
+        assert!(release_tag_arg_ok(RELEASE_APK));
 
         let mut sink = Vec::new();
         let deadline = Instant::now();
@@ -1038,16 +1451,13 @@ mod tests {
         assert_eq!(calls, 0);
 
         assert_eq!(
-            classify_metadata("invalid update metadata signature"),
-            UPDATE_SIGNATURE
+            finish_committed_or_fail(std::path::Path::new("."), "committed"),
+            COMMITTED
         );
-        assert_eq!(
-            classify_metadata("matching update artifact not found"),
-            semantic_action::UNSUPPORTED
-        );
-        assert_eq!(
-            classify_metadata("invalid update artifact sha256"),
-            UPDATE_CHECKSUM
+        assert_ne!(COMMITTED, semantic_action::OK);
+        assert_ne!(
+            finish_committed_or_fail(std::path::Path::new("unused-fail"), "install"),
+            semantic_action::OK
         );
         assert_eq!(parse_cert_wire("signature").unwrap_err(), UPDATE_SIGNATURE);
         let hex = "ab".repeat(32);
@@ -1116,36 +1526,86 @@ mod tests {
     }
 
     #[test]
-    fn version_body_picks_a_newer_github_release() {
-        let newer = br#"{"url":"https://github.com/rustdesk/rustdesk/releases/tag/1.4.7"}"#;
-        assert_eq!(
-            release_page_from_version_body(newer, "1.4.6")
-                .unwrap()
-                .as_deref(),
-            Some("https://github.com/rustdesk/rustdesk/releases/tag/1.4.7")
+    fn fork_release_is_the_only_source() {
+        let list = format!(
+            r#"[{{"tag_name":"host-e2-linux-x86_64-20261103","assets":[{{"name":"host.tar.gz","size":10}}]}},{{"tag_name":"device-e1e2e5e8e912-arm64-20261103","assets":[{{"name":"mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk","size":31,"digest":"sha256:{DEVICE_SHA}"}},{{"name":"SHA256SUMS","size":80}}]}}]"#
         );
-        let same = br#"{"url":"https://github.com/rustdesk/rustdesk/releases/tag/1.4.6"}"#;
-        assert_eq!(release_page_from_version_body(same, "1.4.6").unwrap(), None);
+        let choice = choose_release(list.as_bytes(), "arm64", None, None).unwrap();
+        assert_eq!(choice.tag, "device-e1e2e5e8e912-arm64-20261103");
+        assert!(choice.name.ends_with(".apk"));
+        assert_eq!(choice.has_sums, true);
+        let sums = format!("{DEVICE_SHA}  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n");
+        let admitted = lock_sha(&choice, Some(&sums)).unwrap();
+        assert!(admitted.url.starts_with(
+            "https://github.com/1304257658/mobile-cu-bridge/releases/download/device-e1e2e5e8e912-arm64-20261103/"
+        ));
+        assert!(!admitted.url.contains("rustdesk/rustdesk"));
+        assert!(!admitted.url.contains("api.rustdesk.com"));
+        assert_eq!(admitted.sha256, DEVICE_SHA);
         assert_eq!(
-            release_page_from_version_body(br#"{"url":"https://example.com/x"}"#, "1.4.6"),
-            Err(UPDATE_NETWORK)
-        );
-        assert_eq!(
-            release_page_from_version_body(
-                &vec![b'{'; VERSION_BODY_MAX_BYTES as usize + 1],
-                "1.4.6"
-            ),
+            lock_sha(&choice, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n")),
             Err(UPDATE_CHECKSUM)
         );
+        assert_eq!(
+            choose_release(list.as_bytes(), "x86_64", None, None),
+            Err(semantic_action::UNSUPPORTED)
+        );
+        assert_eq!(
+            choose_release(br#"{"message":"not-a-release"}"#, "arm64", None, None),
+            Err(semantic_action::UNSUPPORTED)
+        );
+        assert!(banned_upstream("https://api.rustdesk.com/version/latest"));
+        assert!(banned_upstream(
+            "https://github.com/rustdesk/rustdesk/releases/tag/1.4.6"
+        ));
+        assert!(!banned_upstream(RELEASE_APK));
         assert_eq!(android_update_arch() == "unknown", false);
         #[cfg(not(target_os = "android"))]
         {
             assert_eq!(execute(""), semantic_action::UNSUPPORTED);
             assert_eq!(
-                execute("https://example.com/a.apk"),
+                execute("https://github.com/rustdesk/rustdesk/releases/tag/1.4.6"),
+                semantic_action::UNSUPPORTED
+            );
+            assert_eq!(
+                execute("https://api.rustdesk.com/version/latest"),
                 semantic_action::UNSUPPORTED
             );
         }
+    }
+
+    #[test]
+    fn post_replace_reports_the_id_from_disk() {
+        let dir = std::env::temp_dir().join(format!(
+            "peer-apk-id-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let before = material("enc-v1");
+        write_snapshot(&dir, &before).unwrap();
+        assert!(snap_path(&dir).is_file());
+        assert_eq!(finish_committed_or_fail(&dir, "committed"), COMMITTED);
+        assert!(snap_path(&dir).is_file(), "commit must keep the snapshot");
+        assert_ne!(COMMITTED, semantic_action::OK);
+
+        let kept = b"id = \"\"\nenc_id = \"enc-v1\"\n";
+        std::fs::write(config_file(&dir), kept).unwrap();
+        assert_eq!(settle_dir(&dir).unwrap(), Some(semantic_action::OK));
+        assert!(!snap_path(&dir).exists());
+        assert_eq!(take_verdict(&dir), Some(semantic_action::OK));
+        assert_eq!(take_verdict(&dir), None);
+
+        write_snapshot(&dir, &before).unwrap();
+        std::fs::write(config_file(&dir), b"id = \"999\"\nenc_id = \"enc-other\"\n").unwrap();
+        assert_eq!(settle_dir(&dir).unwrap(), Some(UPDATE_ID_CHANGED));
+        assert_eq!(take_verdict(&dir), Some(UPDATE_ID_CHANGED));
+        assert!(!semantic_action::is_peer_success(UPDATE_ID_CHANGED));
+
+        write_snapshot(&dir, &before).unwrap();
+        let _ = std::fs::remove_file(config_file(&dir));
+        assert_eq!(settle_dir(&dir).unwrap(), Some(UPDATE_ID_CHANGED));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
 

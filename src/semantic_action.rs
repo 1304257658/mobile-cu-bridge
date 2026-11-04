@@ -577,10 +577,7 @@ fn activity_name_ok(activity: &str) -> bool {
 }
 
 fn release_page_arg_ok(arg: &str) -> bool {
-    let Ok(release_id) = crate::common::release_id_from_update_url(arg) else {
-        return false;
-    };
-    crate::common::display_version_from_release_id(&release_id).is_ok()
+    crate::peer_apk_update::release_tag_arg_ok(arg)
 }
 
 fn ident_segment(seg: &str) -> bool {
@@ -953,12 +950,28 @@ mod tests {
             gate(
                 &ready,
                 CHECK_UPDATE,
-                "https://github.com/rustdesk/rustdesk/releases/tag/1.4.6"
+                "https://github.com/1304257658/mobile-cu-bridge/releases/tag/device-e1e2e5e8e912-arm64-20261103"
             ),
             OK
         );
         assert_eq!(
             gate(&ready, CHECK_UPDATE, "https://example.com/app.apk"),
+            UNSUPPORTED
+        );
+        assert_eq!(
+            gate(
+                &ready,
+                CHECK_UPDATE,
+                "https://github.com/rustdesk/rustdesk/releases/tag/1.4.6"
+            ),
+            UNSUPPORTED
+        );
+        assert_eq!(
+            gate(
+                &ready,
+                CHECK_UPDATE,
+                "https://api.rustdesk.com/version/latest"
+            ),
             UNSUPPORTED
         );
         assert_eq!(gate(&desktop("Windows"), CHECK_UPDATE, ""), UNSUPPORTED);

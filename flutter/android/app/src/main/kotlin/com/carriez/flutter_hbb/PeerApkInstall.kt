@@ -42,8 +42,8 @@ internal fun peerApkCertWire(context: Context, apkPath: String): String {
 
 /**
  * Same-signature replacement of this package. Does not uninstall.
- * [UPDATE_OK] means the installer accepted the session, not that the
- * device id was re-read. The caller checks the id file after this returns.
+ * Never returns [UPDATE_OK]. A commit the OS accepts returns "committed"
+ * and kills this process. The id result is reported after restart.
  */
 internal fun peerApkCoverInstall(context: Context, apkPath: String): String {
     val file = File(apkPath)
@@ -129,7 +129,8 @@ private fun waitForSession(context: Context, session: PackageInstaller.Session, 
             )
             when (status) {
                 PackageInstaller.STATUS_SUCCESS -> {
-                    slot.code.set(UPDATE_OK)
+                    // The process is replaced after this. Do not report ok here.
+                    slot.code.set("committed")
                     slot.latch.countDown()
                 }
                 PackageInstaller.STATUS_PENDING_USER_ACTION -> {
