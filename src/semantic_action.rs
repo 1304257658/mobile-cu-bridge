@@ -11,6 +11,11 @@
 //!
 //! `list_apps` returns MAIN/LAUNCHER packages only, 40 per page, and stops at
 //! 256. An empty launcher set is `ok` with an empty item list.
+//!
+//! `check_update` downloads the Android peer APK from a GitHub Release,
+//! checks sha256, and cover-installs it only when the signing cert matches.
+//! It does not uninstall. `network`, `checksum`, `signature`, `install`, and
+//! `id_changed` are peer failures, not `inject_failed`.
 
 use base::message_proto::{Message, SemanticAction, SemanticActionResult};
 use hbb_common::{log, protobuf::Message as _};
@@ -22,8 +27,18 @@ pub const OPEN_APP: &str = "open_app";
 pub const LIST_APPS: &str = "list_apps";
 pub const IME: &str = "ime";
 pub const SET_TEXT: &str = "set_text";
+pub const CHECK_UPDATE: &str = "check_update";
 
-pub const KINDS: [&str; 7] = [
+/// Peer APK update failures. Passed through by [`normalize_peer_code`].
+/// They are not [`INJECT_FAILED`]. `id_changed` means the device id or
+/// `enc_id` differed after cover-install.
+pub const UPDATE_NETWORK: &str = "network";
+pub const UPDATE_CHECKSUM: &str = "checksum";
+pub const UPDATE_SIGNATURE: &str = "signature";
+pub const UPDATE_INSTALL: &str = "install";
+pub const UPDATE_ID_CHANGED: &str = "id_changed";
+
+pub const KINDS: [&str; 8] = [
     SYS_BACK,
     SYS_HOME,
     SYS_RECENTS,
@@ -31,6 +46,7 @@ pub const KINDS: [&str; 7] = [
     LIST_APPS,
     IME,
     SET_TEXT,
+    CHECK_UPDATE,
 ];
 
 /// `list_apps` page size and the most items a peer will keep.
@@ -138,6 +154,13 @@ pub fn validate(kind: &str, arg: &str) -> &'static str {
                 UNSUPPORTED
             } else {
                 OK
+            }
+        }
+        CHECK_UPDATE => {
+            if arg.is_empty() || release_page_arg_ok(arg) {
+                OK
+            } else {
+                UNSUPPORTED
             }
         }
         _ => UNSUPPORTED,
@@ -303,6 +326,11 @@ pub fn normalize_peer_code(code: &str) -> &'static str {
         NO_LAUNCH_INTENT => NO_LAUNCH_INTENT,
         START_THREW => START_THREW,
         FG_TIMEOUT => FG_TIMEOUT,
+        UPDATE_NETWORK => UPDATE_NETWORK,
+        UPDATE_CHECKSUM => UPDATE_CHECKSUM,
+        UPDATE_SIGNATURE => UPDATE_SIGNATURE,
+        UPDATE_INSTALL => UPDATE_INSTALL,
+        UPDATE_ID_CHANGED => UPDATE_ID_CHANGED,
         _ => {
             log::warn!("semantic action peer code `{code}` is not a known result");
             INJECT_FAILED
@@ -548,6 +576,10 @@ fn activity_name_ok(activity: &str) -> bool {
     package_name_ok(activity)
 }
 
+fn release_page_arg_ok(arg: &str) -> bool {
+    crate::peer_apk_update::release_tag_arg_ok(arg)
+}
+
 fn ident_segment(seg: &str) -> bool {
     let mut chars = seg.chars();
     match chars.next() {
@@ -572,7 +604,7 @@ mod tests {
 
     #[test]
     fn admits_system_text_and_launch_actions() {
-        assert_eq!(KINDS.len(), 7);
+        assert_eq!(KINDS.len(), 8);
         let g = desktop("Android");
         for kind in [SYS_BACK, SYS_HOME, SYS_RECENTS] {
             assert_eq!(gate(&g, kind, ""), OK, "{kind}");
@@ -908,5 +940,66 @@ mod tests {
             assert!(outcome.detail.is_empty());
             assert_eq!(execute_list_apps_on_peer("nope").code, UNSUPPORTED);
         }
+    }
+
+    #[test]
+    fn check_update_codes_stay_explicit() {
+        let ready = desktop("Android");
+        assert_eq!(gate(&ready, CHECK_UPDATE, ""), OK);
+        assert_eq!(
+            gate(
+                &ready,
+                CHECK_UPDATE,
+                "https://github.com/1304257658/mobile-cu-bridge/releases/tag/device-e1e2e5e8e912-arm64-20261103"
+            ),
+            OK
+        );
+        assert_eq!(
+            gate(&ready, CHECK_UPDATE, "https://example.com/app.apk"),
+            UNSUPPORTED
+        );
+        assert_eq!(
+            gate(
+                &ready,
+                CHECK_UPDATE,
+                "https://github.com/rustdesk/rustdesk/releases/tag/1.4.6"
+            ),
+            UNSUPPORTED
+        );
+        assert_eq!(
+            gate(
+                &ready,
+                CHECK_UPDATE,
+                "https://api.rustdesk.com/version/latest"
+            ),
+            UNSUPPORTED
+        );
+        assert_eq!(gate(&desktop("Windows"), CHECK_UPDATE, ""), UNSUPPORTED);
+        for code in [
+            UPDATE_NETWORK,
+            UPDATE_CHECKSUM,
+            UPDATE_SIGNATURE,
+            UPDATE_INSTALL,
+            UPDATE_ID_CHANGED,
+        ] {
+            assert_eq!(normalize_peer_code(code), code, "{code}");
+            assert_ne!(code, INJECT_FAILED);
+            assert!(!is_peer_success(code));
+            assert!(code.len() <= 32, "{code}");
+            let reply = result_message(CHECK_UPDATE, code);
+            match reply.union {
+                Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
+                    assert_eq!(result.kind, CHECK_UPDATE);
+                    assert_eq!(result.code, code);
+                    assert!(result.detail.is_empty());
+                }
+                other => panic!("expected SemanticActionResult, got {other:?}"),
+            }
+        }
+        let mut flight = Flight::default();
+        store_peer_result(&mut flight, CHECK_UPDATE, UPDATE_ID_CHANGED, "ignored");
+        assert_eq!(flight.result(), UPDATE_ID_CHANGED);
+        assert!(flight.detail().is_empty());
+        assert!(!is_peer_success(flight.result()));
     }
 }

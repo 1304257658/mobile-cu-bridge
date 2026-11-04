@@ -2197,6 +2197,12 @@ impl Connection {
         let mut msg_out = Message::new();
         msg_out.set_login_response(res);
         self.send(msg_out).await;
+        if self.file_transfer.is_none() && !self.view_camera && !self.terminal && !self.is_port_forward()
+        {
+            if let Some(msg) = crate::peer_apk_update::reconnect_result() {
+                self.send(msg).await;
+            }
+        }
         self.update_scoped_login_options().await;
         if let Some((dir, show_hidden)) = self.file_transfer.clone() {
             self.keyboard = false;
@@ -4192,9 +4198,18 @@ impl Connection {
                         };
                         detail = outcome.detail;
                         outcome.code
+                    } else if action.kind == crate::semantic_action::CHECK_UPDATE {
+                        crate::peer_apk_update::run_with_deadline(action.arg.clone()).await
                     } else {
                         crate::semantic_action::execute_on_peer(&action.kind, &action.arg)
                     };
+                    if code == crate::peer_apk_update::COMMITTED {
+                        log::info!(
+                            "peer apk install committed; id result is reported after restart"
+                        );
+                        self.update_auto_disconnect_timer();
+                        return true;
+                    }
                     if code != crate::semantic_action::OK {
                         log::warn!("semantic action {} -> {code}", action.kind);
                     }

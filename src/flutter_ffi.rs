@@ -3130,6 +3130,7 @@ pub mod server_side {
         if let Ok(app_dir) = env.get_string(&app_dir) {
             *config::APP_DIR.write().unwrap() = app_dir.into();
         }
+        crate::peer_apk_update::settle_persisted_snapshot();
         if let Ok(home_dir) = env.get_string(&home_dir) {
             *config::APP_HOME_DIR.write().unwrap() = home_dir.into();
         }
