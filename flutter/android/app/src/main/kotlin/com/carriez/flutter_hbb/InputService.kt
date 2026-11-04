@@ -15,6 +15,7 @@ import android.os.Build
 import android.os.Bundle
 import android.os.Handler
 import android.os.Looper
+import android.os.SystemClock
 import android.util.Log
 import android.widget.EditText
 import android.view.accessibility.AccessibilityEvent
@@ -29,7 +30,10 @@ import android.accessibilityservice.AccessibilityServiceInfo.FLAG_INPUT_METHOD_E
 import android.accessibilityservice.AccessibilityServiceInfo.FLAG_RETRIEVE_INTERACTIVE_WINDOWS
 import android.view.inputmethod.EditorInfo
 import androidx.annotation.RequiresApi
+import java.lang.InterruptedException
 import java.util.*
+import java.util.concurrent.atomic.AtomicBoolean
+import kotlin.concurrent.thread
 import java.lang.Character
 import kotlin.math.abs
 import kotlin.math.max
@@ -93,6 +97,7 @@ class InputService : AccessibilityService() {
     }
 
     private val logTag = "input service"
+    private val launcherPackagesLogged = AtomicBoolean(false)
     private var leftIsDown = false
     private var touchPath = Path()
     private var stroke: GestureDescription.StrokeDescription? = null
@@ -774,8 +779,9 @@ class InputService : AccessibilityService() {
 
     /**
      * Session semantic shortcut. System keys use global accessibility actions,
-     * open_app starts a launcher intent, and set_text / ime write the focused
-     * field. No pointer gesture and no clipboard write.
+     * open_app starts a launcher intent and waits until that package is in
+     * front, and set_text / ime write the focused field. No pointer gesture
+     * and no clipboard write.
      */
     fun performSemanticAction(kind: String, arg: String): String {
         return when (kind) {
@@ -783,6 +789,7 @@ class InputService : AccessibilityService() {
             "sys.home" -> globalAction(GLOBAL_ACTION_HOME)
             "sys.recents" -> globalAction(GLOBAL_ACTION_RECENTS)
             "open_app" -> openApp(arg)
+            "list_apps" -> listApps(arg)
             "ime" -> setImeMode(arg)
             "set_text" -> setFocusedText(arg)
             else -> "unsupported"
@@ -813,16 +820,16 @@ class InputService : AccessibilityService() {
         val slash = spec.indexOf('/')
         val pkg = if (slash < 0) spec else spec.substring(0, slash)
         if (pkg.isEmpty()) {
-            return "unsupported"
+            return OPEN_UNSUPPORTED
         }
         val intent = if (slash < 0) {
             packageManager.getLaunchIntentForPackage(pkg)?.apply {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
-            } ?: return "inject_failed"
+            } ?: return openAppCode(pkg, OpenStart.NO_LAUNCH_INTENT, false)
         } else {
             val activity = spec.substring(slash + 1)
             if (activity.isEmpty()) {
-                return "unsupported"
+                return OPEN_UNSUPPORTED
             }
             val cls = if (activity.startsWith(".")) pkg + activity else activity
             Intent(Intent.ACTION_MAIN).apply {
@@ -831,13 +838,149 @@ class InputService : AccessibilityService() {
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
         }
-        return try {
+        val start = try {
             startActivity(intent)
-            "ok"
+            OpenStart.STARTED
         } catch (e: RuntimeException) {
-            Log.e(logTag, "open_app $pkg failed", e)
+            Log.e(logTag, "open_app $pkg start threw", e)
+            OpenStart.START_THREW
+        }
+        if (start != OpenStart.STARTED) {
+            return openAppCode(pkg, start, false)
+        }
+        return openAppCode(pkg, OpenStart.STARTED, waitUntilForeground(pkg))
+    }
+
+    private fun openAppCode(pkg: String, start: OpenStart, sawPackage: Boolean): String {
+        val code = openAppPeerCode(start, sawPackage)
+        if (code != OPEN_OK) {
+            Log.e(logTag, "open_app $pkg -> $code")
+        }
+        return code
+    }
+
+    // MAIN/LAUNCHER only, same probe as the connect-time log. Not
+    // getInstalledPackages. The kept list stops at LIST_APPS_CAP.
+    private fun listApps(arg: String): String {
+        val offset = listAppsOffset(arg) ?: return OPEN_UNSUPPORTED
+        return try {
+            val pm = packageManager
+            val probe = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+            @Suppress("DEPRECATION")
+            val matches = pm.queryIntentActivities(probe, 0)
+            var index = 0
+            val page = collectLauncherPage(offset, object : Iterator<LauncherRow> {
+                override fun hasNext(): Boolean = index < matches.size
+                override fun next(): LauncherRow {
+                    val info = matches[index]
+                    index += 1
+                    val pkg = info.activityInfo?.packageName.orEmpty()
+                    val activity = info.activityInfo?.name
+                    val label = try {
+                        info.loadLabel(pm)?.toString()
+                    } catch (_: RuntimeException) {
+                        null
+                    }
+                    return LauncherRow(pkg, label, activity)
+                }
+            })
+            if (page.code != OPEN_OK) {
+                Log.e(logTag, "list_apps -> ${page.code}")
+            }
+            listAppsWire(page)
+        } catch (e: RuntimeException) {
+            Log.e(logTag, "list_apps query failed", e)
             "inject_failed"
         }
+    }
+
+    // One log of MAIN/LAUNCHER packages when the service connects.
+    // Not an open_app result, and not getInstalledPackages.
+    private fun logInstalledLaunchersOnce() {
+        if (!launcherPackagesLogged.compareAndSet(false, true)) {
+            return
+        }
+        val pm = packageManager
+        thread(name = "open-app-launchers", isDaemon = true) {
+            try {
+                val probe = Intent(Intent.ACTION_MAIN).addCategory(Intent.CATEGORY_LAUNCHER)
+                val seen = sortedSetOf<String>()
+                @Suppress("DEPRECATION")
+                val matches = pm.queryIntentActivities(probe, 0)
+                for (info in matches) {
+                    val pkg = info.activityInfo?.packageName ?: continue
+                    if (pkg.isEmpty()) continue
+                    val cls = info.activityInfo?.name.orEmpty()
+                    val label = try {
+                        info.loadLabel(pm)?.toString()?.replace('\n', ' ')?.trim().orEmpty()
+                    } catch (_: RuntimeException) {
+                        ""
+                    }
+                    val line = if (label.isEmpty()) "$pkg $cls".trim() else "$pkg $cls $label"
+                    seen.add(line)
+                }
+                Log.i(logTag, "open_app launchers ${seen.size}")
+                for (line in seen) {
+                    Log.i(logTag, "open_app launcher $line")
+                }
+            } catch (e: RuntimeException) {
+                Log.e(logTag, "open_app launcher list failed", e)
+            }
+        }
+    }
+
+    private fun waitUntilForeground(pkg: String): Boolean {
+        val polls = openAppMaxPolls()
+        if (polls <= 0) return false
+        val deadline = SystemClock.uptimeMillis() + OPEN_APP_TIMEOUT_MS
+        var i = 0
+        var loggedReadFailure = false
+        while (i < polls && SystemClock.uptimeMillis() < deadline) {
+            try {
+                if (foregroundIs(pkg)) return true
+            } catch (e: RuntimeException) {
+                if (!loggedReadFailure) {
+                    loggedReadFailure = true
+                    Log.e(logTag, "open_app foreground read failed", e)
+                }
+            }
+            i += 1
+            if (i >= polls) return false
+            val left = deadline - SystemClock.uptimeMillis()
+            if (left <= 0L) return false
+            try {
+                Thread.sleep(minOf(OPEN_APP_POLL_MS, left))
+            } catch (e: InterruptedException) {
+                Thread.currentThread().interrupt()
+                return false
+            }
+        }
+        return false
+    }
+
+    private fun foregroundIs(pkg: String): Boolean {
+        return rootPackageIs(pkg) || windowPackageIs(pkg)
+    }
+
+    private fun rootPackageIs(pkg: String): Boolean {
+        val root = rootInActiveWindow ?: return false
+        val found = root.packageName?.toString() == pkg
+        if (Build.VERSION.SDK_INT < 33) root.recycle()
+        return found
+    }
+
+    private fun windowPackageIs(pkg: String): Boolean {
+        val wins = windows ?: return false
+        var found = false
+        for (w in wins) {
+            if (!found && (w.isActive || w.isFocused)) {
+                val root = w.root
+                if (root?.packageName?.toString() == pkg) found = true
+                if (Build.VERSION.SDK_INT < 33 && root != null) root.recycle()
+            }
+            if (Build.VERSION.SDK_INT < 33) w.recycle()
+        }
+        return found
     }
 
     private fun setFocusedText(text: String): String {
@@ -882,6 +1025,7 @@ class InputService : AccessibilityService() {
             // AccessibilityInputConnection on SDK 33+ is not InputConnection.
             // It has no getExtractedText / batch edit; surrounding text plus
             // commitText(text, pos, textAttribute) is the supported replace.
+            // commitText returns void, so the result is the read-back below.
             val surrounding = ic.getSurroundingText(SEMANTIC_TEXT_MAX, SEMANTIC_TEXT_MAX, 0)
                 ?: return null
             val existing = surrounding.text?.length ?: 0
@@ -892,7 +1036,19 @@ class InputService : AccessibilityService() {
             val start = surrounding.offset
             ic.setSelection(start, start + existing)
             ic.commitText(text, 1, null)
-            "ok"
+            val readBack = ic.getSurroundingText(SEMANTIC_TEXT_MAX, SEMANTIC_TEXT_MAX, 0)
+            val result = semanticCommitResult(
+                text,
+                readBack?.let { it.text?.toString() ?: "" },
+                readBack?.offset ?: -1,
+                readBack?.selectionStart ?: -1,
+                readBack?.selectionEnd ?: -1,
+                SEMANTIC_TEXT_MAX,
+            )
+            if (result != "ok") {
+                Log.e(logTag, "set_text unverified after commitText")
+            }
+            result
         } catch (e: RuntimeException) {
             Log.e(logTag, "set_text input connection failed", e)
             "inject_failed"
@@ -920,6 +1076,7 @@ class InputService : AccessibilityService() {
         val layout = fakeEditTextForTextStateCalculation?.getLayout()
         Log.d(logTag, "fakeEditTextForTextStateCalculation layout:$layout")
         Log.d(logTag, "onServiceConnected!")
+        logInstalledLaunchersOnce()
     }
 
     override fun onDestroy() {

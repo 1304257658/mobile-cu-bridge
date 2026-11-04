@@ -725,6 +725,8 @@ pub fn session_semantic_action(
 
 /// Peer completion for [`session_semantic_action`]. `ok` here is success.
 /// No stored completion returns `inject_failed: no peer result`, not an empty string.
+/// `list_apps` items are [`session_semantic_detail`], not this code. An empty
+/// items array is still `ok`.
 pub fn session_semantic_result(session_id: SessionID) -> SyncReturn<String> {
     let code = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
         session.semantic_result()
@@ -732,6 +734,19 @@ pub fn session_semantic_result(session_id: SessionID) -> SyncReturn<String> {
         crate::semantic_action::NO_SESSION.to_owned()
     };
     SyncReturn(code)
+}
+
+/// JSON payload for the latest peer result. `list_apps` success is
+/// `{"items":[...],"truncated":bool}`. Empty when the result has no payload.
+/// Read the code from [`session_semantic_result`]; an empty items array is
+/// still success.
+pub fn session_semantic_detail(session_id: SessionID) -> SyncReturn<String> {
+    let detail = if let Some(session) = sessions::get_session_by_session_id(&session_id) {
+        session.semantic_detail()
+    } else {
+        String::new()
+    };
+    SyncReturn(detail)
 }
 
 // chat_client_mode
@@ -3115,6 +3130,7 @@ pub mod server_side {
         if let Ok(app_dir) = env.get_string(&app_dir) {
             *config::APP_DIR.write().unwrap() = app_dir.into();
         }
+        crate::peer_apk_update::settle_persisted_snapshot();
         if let Ok(home_dir) = env.get_string(&home_dir) {
             *config::APP_HOME_DIR.write().unwrap() = home_dir.into();
         }

@@ -346,6 +346,40 @@ pub fn call_main_service_semantic_action(kind: &str, arg: &str) -> JniResult<Str
     }
 }
 
+fn call_main_service_string(method: &str, arg: &str) -> JniResult<String> {
+    if let (Some(jvm), Some(ctx)) = (
+        JVM.read().unwrap().as_ref(),
+        MAIN_SERVICE_CTX.read().unwrap().as_ref(),
+    ) {
+        let mut env = jvm.attach_current_thread_as_daemon()?;
+        let res = env.with_local_frame(16, |env| -> JniResult<String> {
+            let arg = env.new_string(arg)?;
+            let res = env
+                .call_method(
+                    ctx,
+                    method,
+                    "(Ljava/lang/String;)Ljava/lang/String;",
+                    &[JValue::Object(&JObject::from(arg))],
+                )?
+                .l()?;
+            let res = JString::from(res);
+            let res = env.get_string(&res)?;
+            Ok(res.to_string_lossy().to_string())
+        })?;
+        Ok(res)
+    } else {
+        Err(JniError::ThrowFailed(-1))
+    }
+}
+
+pub fn call_main_service_peer_apk_certs(apk_path: &str) -> JniResult<String> {
+    call_main_service_string("rustPeerApkCerts", apk_path)
+}
+
+pub fn call_main_service_peer_apk_cover_install(apk_path: &str) -> JniResult<String> {
+    call_main_service_string("rustPeerApkCoverInstall", apk_path)
+}
+
 pub fn call_main_service_key_event(data: &[u8]) -> JniResult<()> {
     if let (Some(jvm), Some(ctx)) = (
         JVM.read().unwrap().as_ref(),

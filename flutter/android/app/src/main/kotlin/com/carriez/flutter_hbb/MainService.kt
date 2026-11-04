@@ -95,8 +95,24 @@ class MainService : Service() {
     }
 
     @Keep
+    fun rustPeerApkCerts(apkPath: String): String = peerApkCertWire(this, apkPath)
+
+    @Keep
+    fun rustPeerApkCoverInstall(apkPath: String): String = peerApkCoverInstall(this, apkPath)
+
+    @Keep
     fun rustSemanticAction(kind: String, arg: String): String {
-        val svc = InputService.ctx ?: return "inject_failed"
+        val svc = InputService.ctx ?: return when (kind) {
+            "open_app" -> {
+                Log.e(logTag, "open_app service missing")
+                OPEN_UNSUPPORTED
+            }
+            "list_apps" -> {
+                Log.e(logTag, "list_apps service missing")
+                "inject_failed"
+            }
+            else -> "inject_failed"
+        }
         return svc.performSemanticAction(kind, arg)
     }
 

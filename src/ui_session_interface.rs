@@ -971,12 +971,19 @@ impl<T: InvokeUiSession> Session<T> {
         self.semantic_flight.lock().unwrap().result().to_owned()
     }
 
-    pub fn note_semantic_result(&self, kind: &str, code: &str) {
+    /// `list_apps` JSON for the latest peer result, or empty when that result
+    /// has no payload. An empty items array is still success; read the code
+    /// from [`Self::semantic_result`].
+    pub fn semantic_detail(&self) -> String {
+        self.semantic_flight.lock().unwrap().detail().to_owned()
+    }
+
+    pub fn note_semantic_result(&self, kind: &str, code: &str, detail: &str) {
         if kind.len() > 32 {
             log::error!("semantic result kind is {} bytes", kind.len());
         }
         let mut flight = self.semantic_flight.lock().unwrap();
-        flight.finish(code);
+        crate::semantic_action::store_peer_result(&mut flight, kind, code, detail);
         log::debug!("semantic action peer result {}", flight.result());
     }
 

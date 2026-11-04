@@ -67,6 +67,7 @@ mod ui_cm_interface;
 mod ui_interface;
 mod ui_session_interface;
 mod semantic_action;
+mod peer_apk_update;
 
 mod hbbs_http;
 
