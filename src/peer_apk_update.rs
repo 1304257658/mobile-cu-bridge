@@ -86,7 +86,7 @@ impl IdMaterial {
 pub(crate) async fn run_with_deadline(arg: String) -> &'static str {
     match hbb_common::timeout(
         BLOCKING_TIMEOUT_MS,
-        tokio::task::spawn_blocking(move || execute(&arg)),
+        hbb_common::tokio::task::spawn_blocking(move || execute(&arg)),
     )
     .await
     {
