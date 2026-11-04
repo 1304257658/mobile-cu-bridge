@@ -991,21 +991,26 @@ message PortForwardWindowUpdate {
 }
 
 // In-session semantic shortcut. The controlled peer runs it with a system API
-// (accessibility global action, package intent, launcher list, or the focused
-// field). It is not a key event, a clipboard write, or a pointer event.
+// (accessibility global action, package intent, launcher list, the focused
+// field, or a same-signature APK cover-install). It is not a key event, a
+// clipboard write, or a pointer event.
 message SemanticAction {
   // sys.back | sys.home | sys.recents | open_app | list_apps | ime | set_text
+  // | check_update
   string kind = 1;
   // open_app: package or package/activity. set_text: field text.
   // ime: show | hide. list_apps: decimal offset, empty is 0.
+  // check_update: empty, or a rustdesk GitHub release tag URL.
   // Empty for the sys.* kinds.
   string arg = 2;
 }
 
 // Peer result for a SemanticAction. code is ok, unsupported, inject_failed,
 // or an open_app failure: no_launch_intent, start_threw, fg_timeout.
-// Those three are not inject_failed. list_apps uses only ok, unsupported,
-// and inject_failed. An empty launcher set is ok with an empty items array.
+// Those three are not inject_failed. check_update can also be network,
+// checksum, signature, install, or id_changed. Those five are not
+// inject_failed. list_apps uses only ok, unsupported, and inject_failed.
+// An empty launcher set is ok with an empty items array.
 // no_session is decided on the controller and is never sent by the peer.
 message SemanticActionResult {
   string kind = 1;

@@ -10,6 +10,7 @@ const String semanticOpenApp = 'open_app';
 const String semanticListApps = 'list_apps';
 const String semanticIme = 'ime';
 const String semanticSetText = 'set_text';
+const String semanticCheckUpdate = 'check_update';
 
 /// `list_apps` returns at most this many items. The next page starts here.
 const int semanticListAppsPage = 40;
@@ -47,6 +48,14 @@ const String semanticInFlight = 'inject_failed: action in flight';
 const String semanticNoLaunchIntent = 'no_launch_intent';
 const String semanticStartThrew = 'start_threw';
 const String semanticFgTimeout = 'fg_timeout';
+
+/// Peer `check_update` failures. Not success, and not [semanticInjectFailed].
+/// `id_changed` means the device id or enc_id differed after cover-install.
+const String semanticUpdateNetwork = 'network';
+const String semanticUpdateChecksum = 'checksum';
+const String semanticUpdateSignature = 'signature';
+const String semanticUpdateInstall = 'install';
+const String semanticUpdateIdChanged = 'id_changed';
 
 /// True only when [peerResult] is the peer completion `ok`.
 ///

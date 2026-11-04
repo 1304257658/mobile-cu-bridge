@@ -4192,6 +4192,10 @@ impl Connection {
                         };
                         detail = outcome.detail;
                         outcome.code
+                    } else if action.kind == crate::semantic_action::CHECK_UPDATE {
+                        // Download, hash, and cover-install return their own
+                        // code. This bound only fires if that call never comes back.
+                        crate::peer_apk_update::run_with_deadline(action.arg.clone()).await
                     } else {
                         crate::semantic_action::execute_on_peer(&action.kind, &action.arg)
                     };
