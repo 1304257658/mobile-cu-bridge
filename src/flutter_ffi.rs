@@ -737,7 +737,8 @@ pub fn session_semantic_result(session_id: SessionID) -> SyncReturn<String> {
 }
 
 /// JSON payload for the latest peer result. `list_apps` success is
-/// `{"items":[...],"truncated":bool}`. Empty when the result has no payload.
+/// `{"items":[...],"truncated":bool}`. `snapshot` success is the ref tree.
+/// Empty when the result has no payload.
 /// Read the code from [`session_semantic_result`]; an empty items array is
 /// still success.
 pub fn session_semantic_detail(session_id: SessionID) -> SyncReturn<String> {

@@ -4139,10 +4139,24 @@ impl Connection {
                 }
                 Some(message::Union::SemanticAction(action)) => {
                     let mut detail = String::new();
+                    let mut deferred = false;
                     let code = if self.is_authed_view_camera_conn() {
                         crate::semantic_action::UNSUPPORTED
                     } else if !self.peer_keyboard_enabled() {
                         crate::semantic_action::INJECT_FAILED
+                    } else if action.kind == crate::semantic_action::SNAPSHOT
+                        || action.kind == crate::semantic_action::CLICK
+                    {
+                        // The walk runs on its own thread. This loop keeps
+                        // reading the session while that thread is in flight.
+                        deferred = true;
+                        let kind = action.kind.clone();
+                        let arg = action.arg.clone();
+                        let mut inner = self.inner.clone();
+                        crate::a11y_snapshot::dispatch(kind, arg, move |msg| {
+                            inner.send(std::sync::Arc::new(msg));
+                        });
+                        crate::semantic_action::OK
                     } else if action.kind == crate::semantic_action::OPEN_APP {
                         // Foreground polling is bounded inside the peer. This
                         // outer bound also returns if that call never comes back.
@@ -4203,26 +4217,28 @@ impl Connection {
                     } else {
                         crate::semantic_action::execute_on_peer(&action.kind, &action.arg)
                     };
-                    if code == crate::peer_apk_update::COMMITTED {
+                    if !deferred && code == crate::peer_apk_update::COMMITTED {
                         log::info!(
                             "peer apk install committed; id result is reported after restart"
                         );
                         self.update_auto_disconnect_timer();
                         return true;
                     }
-                    if code != crate::semantic_action::OK {
-                        log::warn!("semantic action {} -> {code}", action.kind);
+                    if !deferred {
+                        if code != crate::semantic_action::OK {
+                            log::warn!("semantic action {} -> {code}", action.kind);
+                        }
+                        let msg = if detail.is_empty() {
+                            crate::semantic_action::result_message(&action.kind, code)
+                        } else {
+                            crate::semantic_action::result_message_with_detail(
+                                &action.kind,
+                                code,
+                                &detail,
+                            )
+                        };
+                        self.send(msg).await;
                     }
-                    let msg = if detail.is_empty() {
-                        crate::semantic_action::result_message(&action.kind, code)
-                    } else {
-                        crate::semantic_action::result_message_with_detail(
-                            &action.kind,
-                            code,
-                            &detail,
-                        )
-                    };
-                    self.send(msg).await;
                     self.update_auto_disconnect_timer();
                 }
                 _ => {}

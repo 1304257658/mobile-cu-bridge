@@ -14,7 +14,11 @@ void main() {
     expect(semanticKinds.toSet().length, semanticKinds.length);
     expect(semanticListApps, 'list_apps');
     expect(semanticCheckUpdate, 'check_update');
+    expect(semanticSnapshot, 'snapshot');
+    expect(semanticClick, 'click');
     expect(semanticKinds.contains(semanticCheckUpdate), isFalse);
+    expect(semanticKinds.contains(semanticSnapshot), isFalse);
+    expect(semanticKinds.contains(semanticClick), isFalse);
     expect(semanticListAppsPage, 40);
     expect(semanticListAppsCap, 256);
   });
@@ -67,6 +71,13 @@ void main() {
       semanticUpdateInstall,
       semanticUpdateIdChanged,
     ]) {
+      expect(semanticPeerSuccess(code), isFalse);
+      expect(code, isNot(contains(semanticInjectFailed)));
+      expect(code, isNot(semanticOk));
+    }
+    expect(semanticSnapshotFailed, 'snapshot_failed');
+    expect(semanticRefStale, 'ref_stale');
+    for (final code in [semanticSnapshotFailed, semanticRefStale]) {
       expect(semanticPeerSuccess(code), isFalse);
       expect(code, isNot(contains(semanticInjectFailed)));
       expect(code, isNot(semanticOk));

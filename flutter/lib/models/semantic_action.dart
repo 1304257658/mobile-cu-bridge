@@ -11,6 +11,13 @@ const String semanticListApps = 'list_apps';
 const String semanticIme = 'ime';
 const String semanticSetText = 'set_text';
 const String semanticCheckUpdate = 'check_update';
+const String semanticSnapshot = 'snapshot';
+const String semanticClick = 'click';
+
+/// Peer snapshot / click failures. Not success, and not [semanticInjectFailed].
+/// [semanticRefStale] is an unknown or expired ref.
+const String semanticSnapshotFailed = 'snapshot_failed';
+const String semanticRefStale = 'ref_stale';
 
 /// `list_apps` returns at most this many items. The next page starts here.
 const int semanticListAppsPage = 40;

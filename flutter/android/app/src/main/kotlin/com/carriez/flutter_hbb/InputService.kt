@@ -780,8 +780,9 @@ class InputService : AccessibilityService() {
     /**
      * Session semantic shortcut. System keys use global accessibility actions,
      * open_app starts a launcher intent and waits until that package is in
-     * front, and set_text / ime write the focused field. No pointer gesture
-     * and no clipboard write.
+     * front, and set_text / ime write the focused field. snapshot reads the
+     * active window and click performs ACTION_CLICK on a ref from that
+     * snapshot. No pointer gesture and no clipboard write.
      */
     fun performSemanticAction(kind: String, arg: String): String {
         return when (kind) {
@@ -792,6 +793,8 @@ class InputService : AccessibilityService() {
             "list_apps" -> listApps(arg)
             "ime" -> setImeMode(arg)
             "set_text" -> setFocusedText(arg)
+            "snapshot" -> semanticSnapshot(this, rootInActiveWindow)
+            "click" -> semanticClick(this, rootInActiveWindow, arg)
             else -> "unsupported"
         }
     }
