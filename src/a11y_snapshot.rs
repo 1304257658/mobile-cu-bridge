@@ -121,6 +121,8 @@ pub struct Peer {
     spawns: Arc<AtomicUsize>,
     gen: AtomicU64,
     table: Mutex<RefTable>,
+    #[cfg(test)]
+    publish_gap: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 enum Refuse {
@@ -247,6 +249,8 @@ impl Peer {
             table: Mutex::new(RefTable {
                 entries: HashMap::new(),
             }),
+            #[cfg(test)]
+            publish_gap: Mutex::new(None),
         }
     }
 
@@ -425,26 +429,33 @@ impl Peer {
         collected: Collected,
         now: Instant,
     ) -> Option<Outcome> {
-        let current = self.flight.lock().unwrap().holder == token;
-        if !current {
+        if !self.still_current(token) {
             return None;
         }
-        Some(self.publish(collected, now))
-    }
-
-    fn publish(&self, collected: Collected, now: Instant) -> Outcome {
+        #[cfg(test)]
+        {
+            let hook = self.publish_gap.lock().unwrap().take();
+            if let Some(hook) = hook {
+                hook();
+            }
+        }
         let gen = self.gen.load(Ordering::Relaxed).saturating_add(1);
         let built = match build_snapshot(&collected, &self.caps, gen) {
             Ok(built) => built,
-            Err(()) => return Outcome::fail(),
+            Err(()) => return self.fail_if_current(token),
         };
         let expires = match now.checked_add(Duration::from_millis(self.caps.ref_ttl_ms)) {
             Some(expires) => expires,
             None => {
                 log::error!("semantic snapshot ref expiry overflowed");
-                return Outcome::fail();
+                return self.fail_if_current(token);
             }
         };
+        let flight = self.flight.lock().unwrap();
+        let mut table = self.table.lock().unwrap();
+        if flight.holder != token {
+            return None;
+        }
         if !built.reason.is_empty() {
             log::warn!(
                 "semantic snapshot truncated: {} refs, reason {}",
@@ -452,16 +463,19 @@ impl Peer {
                 built.reason
             );
         }
-        let mut table = self.table.lock().unwrap();
         table.entries.clear();
         for (r, target) in built.refs {
             table.entries.insert(r, Entry { expires, target });
         }
         self.gen.store(gen, Ordering::Release);
-        Outcome {
+        Some(Outcome {
             code: OK,
             detail: built.detail,
-        }
+        })
+    }
+
+    fn fail_if_current(&self, token: u64) -> Option<Outcome> {
+        self.still_current(token).then(Outcome::fail)
     }
 }
 
@@ -1011,6 +1025,13 @@ fn check_detail(detail: &str) -> Result<(), &'static str> {
     Ok(())
 }
 
+fn refuse_message(kind: &str, why: Refuse) -> Message {
+    match why {
+        Refuse::Wedged => result_message_with_detail(kind, SNAPSHOT_FAILED, A11Y_WEDGED),
+        Refuse::Held => result_message(kind, SNAPSHOT_FAILED),
+    }
+}
+
 fn to_message(kind: &str, outcome: &Outcome) -> Message {
     if outcome.detail.is_empty() {
         result_message(kind, outcome.code)
@@ -1067,10 +1088,7 @@ pub fn dispatch(kind: String, arg: String, send: impl FnOnce(Message) + Send + '
         })
     };
     if let Err(why) = started {
-        send(match why {
-            Refuse::Wedged => result_message_with_detail(&kind, SNAPSHOT_FAILED, A11Y_WEDGED),
-            Refuse::Held => result_message(&kind, SNAPSHOT_FAILED),
-        });
+        send(refuse_message(&kind, why));
         return;
     }
     arm_timeout(rx, timeout, kind, send);
@@ -1798,6 +1816,77 @@ mod tests {
             OK
         );
         assert!(clicked);
+    }
+
+    fn controller_result(msg: Message) -> (String, String) {
+        let bytes = msg.write_to_bytes().unwrap();
+        let parsed = Message::parse_from_bytes(&bytes).unwrap();
+        let result = match parsed.union {
+            Some(base::message_proto::message::Union::SemanticActionResult(result)) => result,
+            other => panic!("expected SemanticActionResult, got {other:?}"),
+        };
+        let mut flight = crate::semantic_action::Flight::default();
+        crate::semantic_action::store_peer_result(
+            &mut flight,
+            &result.kind,
+            &result.code,
+            &result.detail,
+        );
+        (flight.result().to_owned(), flight.detail().to_owned())
+    }
+
+    #[test]
+    fn wedged_detail_reaches_the_controller() {
+        for kind in [SNAPSHOT, CLICK] {
+            let (code, detail) = controller_result(refuse_message(kind, Refuse::Wedged));
+            assert_eq!(code, SNAPSHOT_FAILED);
+            assert_eq!(detail, A11Y_WEDGED);
+        }
+        let (code, detail) = controller_result(refuse_message(SNAPSHOT, Refuse::Held));
+        assert_eq!(code, SNAPSHOT_FAILED);
+        assert!(detail.is_empty());
+        let (code, detail) = controller_result(result_message_with_detail(
+            SNAPSHOT,
+            SNAPSHOT_FAILED,
+            "busy",
+        ));
+        assert_eq!(code, SNAPSHOT_FAILED);
+        assert!(detail.is_empty());
+    }
+
+    #[test]
+    fn a_stale_token_cannot_overwrite_the_table_after_the_check() {
+        let peer = Arc::new(peer());
+        let now = Instant::now();
+        {
+            let mut flight = peer.flight.lock().unwrap();
+            flight.holder = 7;
+        }
+        let hooked = Arc::clone(&peer);
+        *peer.publish_gap.lock().unwrap() = Some(Box::new(move || {
+            let mut flight = hooked.flight.lock().unwrap();
+            flight.holder = 8;
+            drop(flight);
+            let mut table = hooked.table.lock().unwrap();
+            table.entries.clear();
+            table.entries.insert(
+                "kept".into(),
+                Entry {
+                    expires: now + Duration::from_secs(5),
+                    target: Target {
+                        path: vec![1],
+                        bounds: [4, 4, 4, 4],
+                    },
+                },
+            );
+        }));
+        let late =
+            peer.publish_if_current(7, collect(vec![sample("LATE", vec![0], [1, 1, 2, 2])]), now);
+        assert!(late.is_none());
+        let table = peer.table.lock().unwrap();
+        assert!(table.entries.contains_key("kept"));
+        assert_eq!(table.entries.len(), 1);
+        assert_eq!(table.entries["kept"].target.bounds, [4, 4, 4, 4]);
     }
 
     #[test]

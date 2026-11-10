@@ -209,9 +209,12 @@ pub fn result_message(kind: &str, code: &str) -> Message {
     msg
 }
 
-/// Like [`result_message`], plus a `list_apps` detail payload.
+/// Like [`result_message`], plus a detail payload the controller is allowed to see.
 ///
-/// Any other kind drops the detail. `open_app` failure codes are unchanged.
+/// `list_apps` and a successful snapshot keep their payload. `snapshot` and
+/// `click` also keep detail when it is exactly `a11y_wedged` on
+/// `snapshot_failed`. Every other detail is dropped. `open_app` failure codes
+/// are unchanged.
 pub fn result_message_with_detail(kind: &str, code: &str, detail: &str) -> Message {
     let normalized = normalize_peer_code(code);
     let (code, detail) = if kind == LIST_APPS && normalized == OK {
@@ -227,6 +230,14 @@ pub fn result_message_with_detail(kind: &str, code: &str, detail: &str) -> Messa
             Ok(detail) => (OK, detail),
             Err(()) => (SNAPSHOT_FAILED, String::new()),
         }
+    } else if (kind == SNAPSHOT || kind == CLICK)
+        && normalized == SNAPSHOT_FAILED
+        && detail == crate::a11y_snapshot::A11Y_WEDGED
+    {
+        (
+            SNAPSHOT_FAILED,
+            crate::a11y_snapshot::A11Y_WEDGED.to_owned(),
+        )
     } else {
         (normalized, String::new())
     };
