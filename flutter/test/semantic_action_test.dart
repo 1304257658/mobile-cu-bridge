@@ -71,5 +71,9 @@ void main() {
       expect(code, isNot(contains(semanticInjectFailed)));
       expect(code, isNot(semanticOk));
     }
+    expect(semanticUpdateAlreadyLatest, 'already_latest');
+    expect(semanticPeerSuccess(semanticUpdateAlreadyLatest), isTrue);
+    expect(semanticUpdateAlreadyLatest, isNot(semanticOk));
+    expect(semanticUpdateAlreadyLatest, isNot(contains(semanticInjectFailed)));
   });
 }

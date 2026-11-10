@@ -50,6 +50,30 @@ internal fun certWire(plan: String, installedHex: String, candidateHex: String):
 }
 
 /**
+ * `ok` plus source path and versionCode, or a reason token.
+ * A reason means the sha cannot be compared, so cover-install stays as it was.
+ */
+internal fun installedApkWire(
+    sourceDir: String,
+    versionCode: Long,
+    isFile: Boolean,
+    symlink: Boolean,
+    size: Long,
+): String {
+    if (sourceDir.isEmpty() ||
+        sourceDir.contains('\n') ||
+        sourceDir.contains('\r') ||
+        !sourceDir.endsWith(".apk")
+    ) {
+        return "no_source"
+    }
+    if (symlink || !isFile) return "not_file"
+    if (size <= 0L || size > PEER_APK_MAX_BYTES) return "bad_size"
+    if (versionCode < 0L) return "bad_version"
+    return "ok\n$sourceDir\n$versionCode"
+}
+
+/**
  * `null` means the file may be streamed. A code means do not install.
  * A symlink or a file past [PEER_APK_MAX_BYTES] is [UPDATE_INSTALL].
  */

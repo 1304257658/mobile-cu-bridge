@@ -57,11 +57,16 @@ const String semanticUpdateSignature = 'signature';
 const String semanticUpdateInstall = 'install';
 const String semanticUpdateIdChanged = 'id_changed';
 
-/// True only when [peerResult] is the peer completion `ok`.
+/// Installed APK sha256 already matches the release. Success, and not [semanticOk].
+/// Cover-install is skipped, so the peer session stays up.
+const String semanticUpdateAlreadyLatest = 'already_latest';
+
+/// True for the peer completion `ok`, and for [semanticUpdateAlreadyLatest].
 ///
 /// Do not pass the return value of `sessionSemanticAction`. That `ok` means
 /// the message was queued.
-bool semanticPeerSuccess(String peerResult) => peerResult == semanticOk;
+bool semanticPeerSuccess(String peerResult) =>
+    peerResult == semanticOk || peerResult == semanticUpdateAlreadyLatest;
 
 /// Empty or missing completion is a readable failure, not success.
 String semanticCompletion(String? peerResult) {

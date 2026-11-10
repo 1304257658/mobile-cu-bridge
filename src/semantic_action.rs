@@ -14,8 +14,10 @@
 //!
 //! `check_update` downloads the Android peer APK from a GitHub Release,
 //! checks sha256, and cover-installs it only when the signing cert matches.
-//! It does not uninstall. `network`, `checksum`, `signature`, `install`, and
-//! `id_changed` are peer failures, not `inject_failed`.
+//! It does not uninstall. When the installed APK sha256 already matches the
+//! release, the peer returns `already_latest` and does not install.
+//! `network`, `checksum`, `signature`, `install`, and `id_changed` are peer
+//! failures, not `inject_failed`.
 
 use base::message_proto::{Message, SemanticAction, SemanticActionResult};
 use hbb_common::{log, protobuf::Message as _};
@@ -37,6 +39,10 @@ pub const UPDATE_CHECKSUM: &str = "checksum";
 pub const UPDATE_SIGNATURE: &str = "signature";
 pub const UPDATE_INSTALL: &str = "install";
 pub const UPDATE_ID_CHANGED: &str = "id_changed";
+
+/// Installed APK sha256 already matches the release. Not a failure.
+/// Cover-install is skipped, so the peer process stays up.
+pub const UPDATE_ALREADY_LATEST: &str = "already_latest";
 
 pub const KINDS: [&str; 8] = [
     SYS_BACK,
@@ -61,8 +67,8 @@ pub const LIST_APPS_BLOCKING_TIMEOUT_MS: u64 = 5_000;
 
 /// Enqueue acknowledgement from `session_semantic_action`, and the peer
 /// completion code from `session_semantic_result`. The enqueue value is not
-/// peer success. Success is only this string when `session_semantic_result`
-/// returns it.
+/// peer success. Peer success is this string, or [`UPDATE_ALREADY_LATEST`]
+/// when `check_update` skips a same-sha cover-install.
 pub const OK: &str = "ok";
 pub const NO_SESSION: &str = "no_session";
 pub const UNSUPPORTED: &str = "unsupported";
@@ -225,12 +231,12 @@ pub fn require_peer_result(stored: &str) -> &str {
     }
 }
 
-/// True only for a peer completion of `ok`.
+/// True for a peer completion of `ok`, and for [`UPDATE_ALREADY_LATEST`].
 ///
 /// [`OK`] from `session_semantic_action` is the enqueue acknowledgement.
 /// Pass the value from `session_semantic_result`, not the enqueue return.
 pub fn is_peer_success(result: &str) -> bool {
-    result == OK
+    result == OK || result == UPDATE_ALREADY_LATEST
 }
 
 /// One semantic action at a time. The next `begin` waits until `finish`.
@@ -331,6 +337,7 @@ pub fn normalize_peer_code(code: &str) -> &'static str {
         UPDATE_SIGNATURE => UPDATE_SIGNATURE,
         UPDATE_INSTALL => UPDATE_INSTALL,
         UPDATE_ID_CHANGED => UPDATE_ID_CHANGED,
+        UPDATE_ALREADY_LATEST => UPDATE_ALREADY_LATEST,
         _ => {
             log::warn!("semantic action peer code `{code}` is not a known result");
             INJECT_FAILED
@@ -1001,5 +1008,28 @@ mod tests {
         assert_eq!(flight.result(), UPDATE_ID_CHANGED);
         assert!(flight.detail().is_empty());
         assert!(!is_peer_success(flight.result()));
+
+        assert_eq!(
+            normalize_peer_code(UPDATE_ALREADY_LATEST),
+            UPDATE_ALREADY_LATEST
+        );
+        assert_eq!(UPDATE_ALREADY_LATEST, "already_latest");
+        assert!(is_peer_success(UPDATE_ALREADY_LATEST));
+        assert_ne!(UPDATE_ALREADY_LATEST, OK);
+        assert_ne!(UPDATE_ALREADY_LATEST, INJECT_FAILED);
+        assert!(UPDATE_ALREADY_LATEST.len() <= 32);
+        let reply = result_message(CHECK_UPDATE, UPDATE_ALREADY_LATEST);
+        match reply.union {
+            Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
+                assert_eq!(result.kind, CHECK_UPDATE);
+                assert_eq!(result.code, UPDATE_ALREADY_LATEST);
+                assert!(result.detail.is_empty());
+            }
+            other => panic!("expected SemanticActionResult, got {other:?}"),
+        }
+        store_peer_result(&mut flight, CHECK_UPDATE, UPDATE_ALREADY_LATEST, "ignored");
+        assert_eq!(flight.result(), UPDATE_ALREADY_LATEST);
+        assert!(flight.detail().is_empty());
+        assert!(is_peer_success(flight.result()));
     }
 }

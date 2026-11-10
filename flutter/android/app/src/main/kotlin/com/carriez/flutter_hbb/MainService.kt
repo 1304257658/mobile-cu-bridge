@@ -101,6 +101,9 @@ class MainService : Service() {
     fun rustPeerApkCoverInstall(apkPath: String): String = peerApkCoverInstall(this, apkPath)
 
     @Keep
+    fun rustPeerApkInstalled(): String = peerApkInstalledWire(this)
+
+    @Keep
     fun rustSemanticAction(kind: String, arg: String): String {
         val svc = InputService.ctx ?: return when (kind) {
             "open_app" -> {

@@ -4210,7 +4210,9 @@ impl Connection {
                         self.update_auto_disconnect_timer();
                         return true;
                     }
-                    if code != crate::semantic_action::OK {
+                    if code != crate::semantic_action::OK
+                        && code != crate::semantic_action::UPDATE_ALREADY_LATEST
+                    {
                         log::warn!("semantic action {} -> {code}", action.kind);
                     }
                     let msg = if detail.is_empty() {
