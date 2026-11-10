@@ -992,16 +992,17 @@ message PortForwardWindowUpdate {
 
 // In-session semantic shortcut. The controlled peer runs it with a system API
 // (accessibility global action, package intent, launcher list, the focused
-// field, or a same-signature APK cover-install). It is not a key event, a
-// clipboard write, or a pointer event.
+// field, a same-signature APK cover-install, or an accessibility snapshot).
+// It is not a key event, a clipboard write, or a pointer event.
 message SemanticAction {
   // sys.back | sys.home | sys.recents | open_app | list_apps | ime | set_text
-  // | check_update
+  // | check_update | snapshot | click
   string kind = 1;
   // open_app: package or package/activity. set_text: field text.
   // ime: show | hide. list_apps: decimal offset, empty is 0.
   // check_update: empty, or an HTTPS tag/asset URL on
   // github.com/1304257658/mobile-cu-bridge. Not rustdesk/rustdesk.
+  // snapshot: empty. click: one ref, or a compact JSON array of up to 8 refs.
   // Empty for the sys.* kinds.
   string arg = 2;
 }
@@ -1010,14 +1011,19 @@ message SemanticAction {
 // or an open_app failure: no_launch_intent, start_threw, fg_timeout.
 // Those three are not inject_failed. check_update can also be network,
 // checksum, signature, install, or id_changed. Those five are not
-// inject_failed. list_apps uses only ok, unsupported, and inject_failed.
+// inject_failed. snapshot can be snapshot_failed. click can be
+// snapshot_failed or ref_stale. Those two are not inject_failed.
+// list_apps uses only ok, unsupported, and inject_failed.
 // An empty launcher set is ok with an empty items array.
 // no_session is decided on the controller and is never sent by the peer.
 message SemanticActionResult {
   string kind = 1;
   string code = 2;
   // list_apps JSON: {"items":[{"package","label","activity"}],"truncated"}.
-  // label and activity are strings or null. Empty for every other kind.
+  // label and activity are strings or null.
+  // snapshot JSON: {"truncated","reason","nodes":[{"ref","cls","text","desc",
+  // "id","pkg","click","b"}]}. reason is "", "nodes", or "payload".
+  // Empty for every other kind.
   string detail = 3;
 }
 

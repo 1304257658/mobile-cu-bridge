@@ -111,6 +111,10 @@ class MainService : Service() {
                 Log.e(logTag, "list_apps service missing")
                 "inject_failed"
             }
+            "snapshot", "click" -> {
+                Log.e(logTag, "$kind service missing")
+                "snapshot_failed"
+            }
             else -> "inject_failed"
         }
         return svc.performSemanticAction(kind, arg)

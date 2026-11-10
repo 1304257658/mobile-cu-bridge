@@ -971,9 +971,9 @@ impl<T: InvokeUiSession> Session<T> {
         self.semantic_flight.lock().unwrap().result().to_owned()
     }
 
-    /// `list_apps` JSON for the latest peer result, or empty when that result
-    /// has no payload. An empty items array is still success; read the code
-    /// from [`Self::semantic_result`].
+    /// `list_apps` or `snapshot` JSON for the latest peer result, or empty when
+    /// that result has no payload. An empty items array is still success; read
+    /// the code from [`Self::semantic_result`].
     pub fn semantic_detail(&self) -> String {
         self.semantic_flight.lock().unwrap().detail().to_owned()
     }

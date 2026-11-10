@@ -16,6 +16,11 @@
 //! checks sha256, and cover-installs it only when the signing cert matches.
 //! It does not uninstall. `network`, `checksum`, `signature`, `install`, and
 //! `id_changed` are peer failures, not `inject_failed`.
+//!
+//! `snapshot` reads the foreground accessibility tree and returns refs.
+//! `click` uses those refs. Limits live in `a11y_snapshot_caps.json`.
+//! `snapshot_failed` and `ref_stale` are peer failures, not `inject_failed`.
+//! A ref expires after its TTL. A later snapshot drops the previous refs.
 
 use base::message_proto::{Message, SemanticAction, SemanticActionResult};
 use hbb_common::{log, protobuf::Message as _};
@@ -28,6 +33,13 @@ pub const LIST_APPS: &str = "list_apps";
 pub const IME: &str = "ime";
 pub const SET_TEXT: &str = "set_text";
 pub const CHECK_UPDATE: &str = "check_update";
+pub const SNAPSHOT: &str = "snapshot";
+pub const CLICK: &str = "click";
+
+/// Peer snapshot / click failures. Passed through by [`normalize_peer_code`].
+/// They are not [`INJECT_FAILED`]. `ref_stale` is an unknown or expired ref.
+pub const SNAPSHOT_FAILED: &str = "snapshot_failed";
+pub const REF_STALE: &str = "ref_stale";
 
 /// Peer APK update failures. Passed through by [`normalize_peer_code`].
 /// They are not [`INJECT_FAILED`]. `id_changed` means the device id or
@@ -38,7 +50,7 @@ pub const UPDATE_SIGNATURE: &str = "signature";
 pub const UPDATE_INSTALL: &str = "install";
 pub const UPDATE_ID_CHANGED: &str = "id_changed";
 
-pub const KINDS: [&str; 8] = [
+pub const KINDS: [&str; 10] = [
     SYS_BACK,
     SYS_HOME,
     SYS_RECENTS,
@@ -47,6 +59,8 @@ pub const KINDS: [&str; 8] = [
     IME,
     SET_TEXT,
     CHECK_UPDATE,
+    SNAPSHOT,
+    CLICK,
 ];
 
 /// `list_apps` page size and the most items a peer will keep.
@@ -163,6 +177,14 @@ pub fn validate(kind: &str, arg: &str) -> &'static str {
                 UNSUPPORTED
             }
         }
+        SNAPSHOT => {
+            if arg.is_empty() {
+                OK
+            } else {
+                UNSUPPORTED
+            }
+        }
+        CLICK => crate::a11y_snapshot::click_arg_verdict(arg),
         _ => UNSUPPORTED,
     }
 }
@@ -199,6 +221,11 @@ pub fn result_message_with_detail(kind: &str, code: &str, detail: &str) -> Messa
                 list_apps_payload_rejected();
                 (INJECT_FAILED, String::new())
             }
+        }
+    } else if kind == SNAPSHOT && normalized == OK {
+        match crate::a11y_snapshot::accept_snapshot_detail(detail) {
+            Ok(detail) => (OK, detail),
+            Err(()) => (SNAPSHOT_FAILED, String::new()),
         }
     } else {
         (normalized, String::new())
@@ -280,6 +307,20 @@ impl Flight {
         }
     }
 
+    fn finish_snapshot(&mut self, code: &str, detail: &str) {
+        self.finish(code);
+        if self.code != OK {
+            return;
+        }
+        match crate::a11y_snapshot::accept_snapshot_detail(detail) {
+            Ok(detail) => self.detail = detail,
+            Err(()) => {
+                self.code = SNAPSHOT_FAILED.to_owned();
+                self.detail.clear();
+            }
+        }
+    }
+
     pub fn result(&self) -> &str {
         require_peer_result(&self.code)
     }
@@ -296,6 +337,8 @@ impl Flight {
 pub fn store_peer_result(flight: &mut Flight, kind: &str, code: &str, detail: &str) {
     if kind == LIST_APPS {
         flight.finish_list(code, detail);
+    } else if kind == SNAPSHOT {
+        flight.finish_snapshot(code, detail);
     } else {
         flight.finish(code);
     }
@@ -331,6 +374,8 @@ pub fn normalize_peer_code(code: &str) -> &'static str {
         UPDATE_SIGNATURE => UPDATE_SIGNATURE,
         UPDATE_INSTALL => UPDATE_INSTALL,
         UPDATE_ID_CHANGED => UPDATE_ID_CHANGED,
+        SNAPSHOT_FAILED => SNAPSHOT_FAILED,
+        REF_STALE => REF_STALE,
         _ => {
             log::warn!("semantic action peer code `{code}` is not a known result");
             INJECT_FAILED
@@ -340,6 +385,10 @@ pub fn normalize_peer_code(code: &str) -> &'static str {
 
 /// Run an already-admitted action on this peer.
 pub fn execute_on_peer(kind: &str, arg: &str) -> &'static str {
+    if kind == SNAPSHOT || kind == CLICK {
+        log::error!("semantic {kind} does not run on the direct peer path");
+        return SNAPSHOT_FAILED;
+    }
     let verdict = validate(kind, arg);
     if verdict != OK {
         return verdict;
@@ -604,7 +653,7 @@ mod tests {
 
     #[test]
     fn admits_system_text_and_launch_actions() {
-        assert_eq!(KINDS.len(), 8);
+        assert_eq!(KINDS.len(), 10);
         let g = desktop("Android");
         for kind in [SYS_BACK, SYS_HOME, SYS_RECENTS] {
             assert_eq!(gate(&g, kind, ""), OK, "{kind}");
@@ -999,6 +1048,55 @@ mod tests {
         let mut flight = Flight::default();
         store_peer_result(&mut flight, CHECK_UPDATE, UPDATE_ID_CHANGED, "ignored");
         assert_eq!(flight.result(), UPDATE_ID_CHANGED);
+        assert!(flight.detail().is_empty());
+        assert!(!is_peer_success(flight.result()));
+    }
+
+    #[test]
+    fn snapshot_and_click_codes_stay_explicit() {
+        let ready = desktop("Android");
+        assert_eq!(gate(&ready, SNAPSHOT, ""), OK);
+        assert_eq!(gate(&ready, SNAPSHOT, "com.sankuai.meituan"), UNSUPPORTED);
+        assert_eq!(gate(&desktop("Windows"), SNAPSHOT, ""), UNSUPPORTED);
+        assert_eq!(gate(&ready, CLICK, "n0"), OK);
+        let nine = format!(
+            "[{}]",
+            (0..9)
+                .map(|i| format!("\"n{i}\""))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(gate(&ready, CLICK, &nine), SNAPSHOT_FAILED);
+        assert_eq!(execute_on_peer(SNAPSHOT, ""), SNAPSHOT_FAILED);
+        assert_eq!(execute_on_peer(CLICK, "n0"), SNAPSHOT_FAILED);
+        for code in [SNAPSHOT_FAILED, REF_STALE] {
+            assert_eq!(normalize_peer_code(code), code, "{code}");
+            assert_ne!(code, INJECT_FAILED);
+            assert!(!is_peer_success(code));
+            let reply = result_message(CLICK, code);
+            match reply.union {
+                Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
+                    assert_eq!(result.code, code);
+                    assert!(result.detail.is_empty());
+                }
+                other => panic!("expected SemanticActionResult, got {other:?}"),
+            }
+        }
+        let page = r#"{"truncated":false,"reason":"","nodes":[]}"#;
+        let mut flight = Flight::default();
+        store_peer_result(&mut flight, SNAPSHOT, OK, page);
+        assert!(is_peer_success(flight.result()));
+        assert!(flight.detail().contains("\"nodes\":[]"));
+        store_peer_result(&mut flight, SNAPSHOT, REF_STALE, page);
+        assert_eq!(flight.result(), REF_STALE);
+        assert!(flight.detail().is_empty());
+        store_peer_result(
+            &mut flight,
+            SNAPSHOT,
+            OK,
+            &"x".repeat(crate::a11y_snapshot::caps().unwrap().payload_max_bytes + 1),
+        );
+        assert_eq!(flight.result(), SNAPSHOT_FAILED);
         assert!(flight.detail().is_empty());
         assert!(!is_peer_success(flight.result()));
     }
