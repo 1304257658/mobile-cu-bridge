@@ -316,6 +316,19 @@ pub fn call_main_service_pointer_input(kind: &str, mask: i32, x: i32, y: i32) ->
     }
 }
 
+pub fn call_main_service_a11y_restart() -> JniResult<bool> {
+    if let (Some(jvm), Some(ctx)) = (
+        JVM.read().unwrap().as_ref(),
+        MAIN_SERVICE_CTX.read().unwrap().as_ref(),
+    ) {
+        let mut env = jvm.attach_current_thread_as_daemon()?;
+        let restarted = env.call_method(ctx, "rustA11yRestart", "()Z", &[])?.z()?;
+        Ok(restarted)
+    } else {
+        Err(JniError::ThrowFailed(-1))
+    }
+}
+
 pub fn call_main_service_semantic_action(kind: &str, arg: &str) -> JniResult<String> {
     if let (Some(jvm), Some(ctx)) = (
         JVM.read().unwrap().as_ref(),

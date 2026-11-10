@@ -20,8 +20,11 @@
 //! worker stays alive; a further stuck call logs `a11y wedged` and does not
 //! start a third thread. That abandoned worker may still be inside the JNI
 //! call. There is no lock around it: the new worker does not wait, and the
-//! late result is dropped by token. Refs look like `g7.n3`: the generation
-//! changes on every installed snapshot, and only clickable nodes get a ref.
+//! late result is dropped by token. A second stuck worker, with the abandoned
+//! one still alive, restarts this process once per ten minutes. Refs look
+//! like `g7.n3`: the generation changes on every installed snapshot. Only
+//! clickable nodes get a ref, and at most 80 of them. Other nodes stay in the
+//! tree with their text and no ref.
 
 use crate::semantic_action::{
     result_message, result_message_with_detail, validate, CLICK, OK, REF_STALE, SNAPSHOT,
@@ -32,16 +35,21 @@ use hbb_common::log;
 use serde_json::Value;
 use std::{
     collections::HashMap,
+    fs,
+    io::Write,
+    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, Instant},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 /// Current worker plus at most one abandoned worker. The timeout reply is not a thread.
 const A11Y_THREAD_CAP: usize = 2;
+/// One in-place restart per ten minutes. The stamp is on disk, so a new process sees it.
+const HEAL_COOLDOWN_MS: u64 = 10 * 60 * 1000;
 
 const CAPS_JSON: &str =
     include_str!("../flutter/android/app/src/main/assets/a11y_snapshot_caps.json");
@@ -114,6 +122,8 @@ pub struct Peer {
     spawns: Arc<AtomicUsize>,
     gen: AtomicU64,
     table: Mutex<RefTable>,
+    heal_path: PathBuf,
+    restarts: Arc<AtomicUsize>,
 }
 
 struct Flight {
@@ -203,6 +213,59 @@ pub fn accept_snapshot_detail(detail: &str) -> Result<String, ()> {
     }
 }
 
+struct HealMark {
+    count: u64,
+    at_ms: u64,
+}
+
+/// Not the device-id toml. A restart must keep that file as it is.
+fn persistent_heal_path() -> PathBuf {
+    hbb_common::config::Config::path("a11y-heal")
+}
+
+fn wall_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
+        .unwrap_or(0)
+}
+
+fn read_heal(path: &Path) -> Option<HealMark> {
+    if !path.exists() {
+        return Some(HealMark { count: 0, at_ms: 0 });
+    }
+    let text = fs::read_to_string(path).ok()?;
+    let mut count = None;
+    let mut at_ms = None;
+    for line in text.lines() {
+        if let Some(v) = line.strip_prefix("count=") {
+            count = v.parse().ok();
+        } else if let Some(v) = line.strip_prefix("at_ms=") {
+            at_ms = v.parse().ok();
+        } else if !line.is_empty() {
+            return None;
+        }
+    }
+    Some(HealMark {
+        count: count?,
+        at_ms: at_ms?,
+    })
+}
+
+fn write_heal(path: &Path, mark: &HealMark) -> bool {
+    if let Some(dir) = path.parent() {
+        if !dir.as_os_str().is_empty() && fs::create_dir_all(dir).is_err() {
+            return false;
+        }
+    }
+    let body = format!("count={}\nat_ms={}\n", mark.count, mark.at_ms);
+    let mut file = match fs::File::create(path) {
+        Ok(file) => file,
+        Err(_) => return false,
+    };
+    file.write_all(body.as_bytes()).is_ok() && file.sync_all().is_ok()
+}
+
 fn peer() -> Option<&'static Peer> {
     static PEER: OnceLock<Option<Peer>> = OnceLock::new();
     PEER.get_or_init(|| caps().ok().map(Peer::new)).as_ref()
@@ -210,6 +273,10 @@ fn peer() -> Option<&'static Peer> {
 
 impl Peer {
     pub fn new(caps: Caps) -> Self {
+        Self::with_heal_path(caps, persistent_heal_path())
+    }
+
+    fn with_heal_path(caps: Caps, heal_path: PathBuf) -> Self {
         Self {
             caps,
             flight: Arc::new(Mutex::new(Flight {
@@ -225,6 +292,8 @@ impl Peer {
             table: Mutex::new(RefTable {
                 entries: HashMap::new(),
             }),
+            heal_path,
+            restarts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -234,6 +303,59 @@ impl Peer {
 
     fn worker_peak(&self) -> usize {
         self.peak_workers.load(Ordering::Acquire)
+    }
+
+    fn restarts(&self) -> usize {
+        self.restarts.load(Ordering::Acquire)
+    }
+
+    fn heal_count(&self) -> Option<u64> {
+        read_heal(&self.heal_path).map(|mark| mark.count)
+    }
+
+    /// Abandoned worker still alive and the current lease has expired.
+    /// Persist first, then ask Android to restart. A failed alarm rolls the
+    /// stamp back so a kill loop cannot burn the cooldown.
+    fn wedge(&self) {
+        let now = wall_ms();
+        let Some(prev) = read_heal(&self.heal_path) else {
+            log::error!("a11y wedged");
+            return;
+        };
+        if now == 0 || (prev.at_ms != 0 && now.saturating_sub(prev.at_ms) < HEAL_COOLDOWN_MS) {
+            log::error!("a11y wedged");
+            return;
+        }
+        let next = HealMark {
+            count: prev.count.saturating_add(1),
+            at_ms: now,
+        };
+        if !write_heal(&self.heal_path, &next) {
+            log::error!("a11y wedged");
+            return;
+        }
+        if !self.arm_restart() {
+            let _ = write_heal(&self.heal_path, &prev);
+            log::error!("a11y wedged");
+        }
+    }
+
+    #[cfg(all(target_os = "android", not(test)))]
+    fn arm_restart(&self) -> bool {
+        match scrap::android::call_main_service_a11y_restart() {
+            Ok(true) => true,
+            Ok(false) => false,
+            Err(e) => {
+                log::error!("a11y restart failed: {e}");
+                false
+            }
+        }
+    }
+
+    #[cfg(any(not(target_os = "android"), test))]
+    fn arm_restart(&self) -> bool {
+        self.restarts.fetch_add(1, Ordering::AcqRel);
+        true
     }
 
     fn acquire(&self, now: Instant) -> Result<Permit, ()> {
@@ -247,7 +369,13 @@ impl Peer {
                 return Err(());
             }
             if flight.abandoned != 0 || live >= A11Y_THREAD_CAP {
-                log::error!("a11y wedged");
+                let heal = flight.abandoned != 0;
+                drop(flight);
+                if heal {
+                    self.wedge();
+                } else {
+                    log::error!("a11y wedged");
+                }
                 return Err(());
             }
             flight.abandoned = flight.holder;
@@ -284,15 +412,14 @@ impl Peer {
         let n = self.live_workers.fetch_add(1, Ordering::AcqRel) + 1;
         self.peak_workers.fetch_max(n, Ordering::AcqRel);
         permit.counted = true;
+        self.spawns.fetch_add(1, Ordering::AcqRel);
         match thread::Builder::new()
             .name("a11y-action".into())
             .spawn(move || work(permit))
         {
-            Ok(_) => {
-                self.spawns.fetch_add(1, Ordering::AcqRel);
-                true
-            }
+            Ok(_) => true,
             Err(e) => {
+                self.spawns.fetch_sub(1, Ordering::AcqRel);
                 log::error!("semantic a11y thread failed: {e}");
                 false
             }
@@ -506,6 +633,7 @@ fn build_snapshot(collected: &Collected, caps: &Caps, gen: u64) -> Result<Built,
     let mut used = reserve;
     let mut reason = "";
     let mut stopped = false;
+    let mut omitted_ref = false;
     let mut visited = 0usize;
     for node in &collected.nodes {
         if visited == caps.max_nodes {
@@ -518,30 +646,31 @@ fn build_snapshot(collected: &Collected, caps: &Caps, gen: u64) -> Result<Built,
             log::error!("semantic snapshot path is {} indexes", node.path.len());
             return Err(());
         }
-        if !node.clickable {
-            continue;
-        }
-        if refs.len() == caps.max_refs {
-            reason = "refs";
-            stopped = true;
-            break;
-        }
-        let r = format!("g{gen}.n{}", refs.len());
+        let r = if node.clickable && refs.len() < caps.max_refs {
+            Some(format!("g{gen}.n{}", refs.len()))
+        } else {
+            if node.clickable {
+                omitted_ref = true;
+            }
+            None
+        };
         let comma = usize::from(!parts.is_empty());
         let room = caps.payload_max_bytes - used - comma;
-        let Some((json, shrunk)) = fit_node(node, &r, room) else {
+        let Some((json, shrunk)) = fit_node(node, r.as_deref(), room) else {
             reason = "payload";
             stopped = true;
             break;
         };
         used += comma + json.len();
-        refs.push((
-            r,
-            Target {
-                path: node.path.clone(),
-                bounds: node.bounds,
-            },
-        ));
+        if let Some(r) = r {
+            refs.push((
+                r,
+                Target {
+                    path: node.path.clone(),
+                    bounds: node.bounds,
+                },
+            ));
+        }
         parts.push(json);
         if shrunk {
             reason = "payload";
@@ -549,7 +678,9 @@ fn build_snapshot(collected: &Collected, caps: &Caps, gen: u64) -> Result<Built,
             break;
         }
     }
-    if !stopped && collected.truncated {
+    if !stopped && omitted_ref {
+        reason = "refs";
+    } else if !stopped && collected.truncated {
         reason = collected.reason;
     }
     let detail = assemble(reason, &parts);
@@ -568,7 +699,7 @@ fn build_snapshot(collected: &Collected, caps: &Caps, gen: u64) -> Result<Built,
     })
 }
 
-fn fit_node(node: &RawNode, r: &str, budget: usize) -> Option<(String, bool)> {
+fn fit_node(node: &RawNode, r: Option<&str>, budget: usize) -> Option<(String, bool)> {
     let full = render_node(
         node,
         r,
@@ -597,7 +728,7 @@ fn fit_node(node: &RawNode, r: &str, budget: usize) -> Option<(String, bool)> {
 
 fn shrink_text(
     node: &RawNode,
-    r: &str,
+    r: Option<&str>,
     budget: usize,
     desc: &str,
     id: &str,
@@ -632,7 +763,7 @@ fn shrink_text(
 
 fn render_node(
     node: &RawNode,
-    r: &str,
+    r: Option<&str>,
     text: &str,
     desc: &str,
     id: &str,
@@ -641,9 +772,12 @@ fn render_node(
 ) -> String {
     let mut out = String::with_capacity(96 + text.len());
     out.push('{');
-    out.push_str("\"ref\":");
-    push_json_str(&mut out, r);
-    out.push_str(",\"cls\":");
+    if let Some(r) = r {
+        out.push_str("\"ref\":");
+        push_json_str(&mut out, r);
+        out.push(',');
+    }
+    out.push_str("\"cls\":");
     push_json_str(&mut out, class_name);
     out.push_str(",\"text\":");
     push_json_str(&mut out, text);
@@ -952,20 +1086,23 @@ fn check_detail(detail: &str) -> Result<(), &'static str> {
     let mut seen = HashMap::new();
     for node in nodes {
         let obj = node.as_object().ok_or("node")?;
-        if obj.len() != 8 {
+        let click = obj.get("click").and_then(|v| v.as_bool()).ok_or("click")?;
+        let has_ref = obj.contains_key("ref");
+        if obj.len() != if has_ref { 8 } else { 7 } || (has_ref && !click) {
             return Err("unexpected node fields");
         }
-        let r = obj.get("ref").and_then(|v| v.as_str()).ok_or("ref")?;
-        if !ref_token_ok(r, caps.max_refs) {
-            return Err("ref");
-        }
-        if seen.insert(r.to_owned(), ()).is_some() {
-            return Err("duplicate ref");
+        if has_ref {
+            let r = obj.get("ref").and_then(|v| v.as_str()).ok_or("ref")?;
+            if !ref_token_ok(r, caps.max_refs) {
+                return Err("ref");
+            }
+            if seen.insert(r.to_owned(), ()).is_some() {
+                return Err("duplicate ref");
+            }
         }
         for key in ["cls", "text", "desc", "id", "pkg"] {
             obj.get(key).and_then(|v| v.as_str()).ok_or(key)?;
         }
-        obj.get("click").and_then(|v| v.as_bool()).ok_or("click")?;
         let bounds = obj.get("b").and_then(|v| v.as_array()).ok_or("b")?;
         if bounds.len() != 4 {
             return Err("b");
@@ -1200,7 +1337,12 @@ mod tests {
     }
 
     fn peer() -> Peer {
-        Peer::new(caps_ok())
+        static N: AtomicU64 = AtomicU64::new(0);
+        let n = N.fetch_add(1, Ordering::Relaxed);
+        Peer::with_heal_path(
+            caps_ok(),
+            std::env::temp_dir().join(format!("a11y-heal-{}-{n}", std::process::id())),
+        )
     }
 
     #[test]
@@ -1359,7 +1501,11 @@ mod tests {
         let parsed: Value = serde_json::from_str(&built.detail).unwrap();
         assert_eq!(parsed["truncated"], true);
         assert_eq!(parsed["reason"], "nodes");
-        assert!(parsed["nodes"].as_array().unwrap().is_empty());
+        let nodes = parsed["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), caps.max_nodes);
+        assert_eq!(nodes[0]["text"], "t0");
+        assert_eq!(nodes[0]["click"], false);
+        assert!(nodes[0].get("ref").is_none());
         assert!(!built.detail.contains("past-cap"));
         assert!(built.detail.len() <= caps.payload_max_bytes);
         assert!(built.refs.is_empty());
@@ -1376,12 +1522,41 @@ mod tests {
         assert_eq!(parsed["truncated"], true);
         assert_eq!(parsed["reason"], "refs");
         let nodes = parsed["nodes"].as_array().unwrap();
-        assert_eq!(nodes.len(), caps.max_refs);
+        assert_eq!(nodes.len(), 100);
         assert_eq!(nodes[0]["ref"], "g7.n0");
         assert_eq!(nodes[79]["ref"], "g7.n79");
         assert_eq!(nodes[0]["click"], true);
-        assert!(!built.detail.contains("\"text\":\"c80\""));
+        assert!(nodes[80].get("ref").is_none());
+        assert_eq!(nodes[80]["text"], "c80");
+        assert_eq!(nodes[80]["click"], true);
+        assert!(built.detail.contains("\"text\":\"c80\""));
         assert_eq!(built.refs.len(), caps.max_refs);
+        accept_snapshot_detail(&built.detail).unwrap();
+    }
+
+    #[test]
+    fn a_text_node_keeps_its_text_and_has_no_ref() {
+        let caps = caps_ok();
+        let mut text = sample("外卖", vec![1u16], [0, 40, 20, 60]);
+        text.clickable = false;
+        let built = build_snapshot(
+            &collect(vec![sample("搜索", vec![0u16], [0, 10, 20, 30]), text]),
+            &caps,
+            1,
+        )
+        .unwrap();
+        let parsed: Value = serde_json::from_str(&built.detail).unwrap();
+        assert_eq!(parsed["truncated"], false);
+        assert_eq!(parsed["reason"], "");
+        let nodes = parsed["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 2);
+        assert_eq!(nodes[0]["ref"], "g1.n0");
+        assert_eq!(nodes[0]["text"], "搜索");
+        assert_eq!(nodes[1]["text"], "外卖");
+        assert_eq!(nodes[1]["click"], false);
+        assert!(nodes[1].get("ref").is_none());
+        assert_eq!(built.refs.len(), 1);
+        accept_snapshot_detail(&built.detail).unwrap();
     }
 
     #[test]
@@ -1652,6 +1827,16 @@ mod tests {
         assert_eq!(peer.threads_started(), before_wedge);
         assert!(peer.live_workers.load(Ordering::Acquire) <= A11Y_THREAD_CAP);
         assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
+        assert_eq!(peer.restarts(), 1);
+        assert_eq!(peer.heal_count(), Some(1));
+        assert_eq!(
+            peer.snapshot_with(after + lease + lease, || panic!("cooldown restart"))
+                .code,
+            SNAPSHOT_FAILED
+        );
+        assert_eq!(peer.restarts(), 1);
+        assert_eq!(peer.heal_count(), Some(1));
+        assert_eq!(peer.threads_started(), before_wedge);
         release_again_tx.send(()).unwrap();
         release_third_tx.send(()).unwrap();
         let _ = again.join().unwrap();

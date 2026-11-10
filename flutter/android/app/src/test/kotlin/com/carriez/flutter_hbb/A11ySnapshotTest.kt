@@ -103,17 +103,17 @@ class A11ySnapshotTest {
     }
 
     @Test
-    fun refCapStopsAfterEightyClickableNodes() {
+    fun walkKeepsClickableNodesPastEighty() {
         val kids = ArrayList<CountingNode>(81)
         for (i in 0 until 81) {
             kids.add(CountingNode(text = "c$i", clickable = true, bounds = intArrayOf(0, i, 1, i + 1)))
         }
         val root = CountingNode(text = "root", children = kids)
         val wire = walkA11y(root, caps)
-        assertEquals("refs", wire.reason)
-        assertTrue(wire.json.contains("\"truncated\":true"))
-        assertFalse(wire.json.contains("\"text\":\"c80\""))
-        assertEquals(caps.maxRefs + 1, root.childCalls)
+        assertEquals("", wire.reason)
+        assertTrue(wire.json.contains("\"text\":\"root\""))
+        assertTrue(wire.json.contains("\"text\":\"c80\""))
+        assertEquals(81, root.childCalls)
     }
 
     @Test

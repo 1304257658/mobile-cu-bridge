@@ -7,8 +7,10 @@ import java.util.ArrayDeque
  * unit test can run without an SDK.
  *
  * Numbers come only from `a11y_snapshot_caps.json`. A walk stops at the node
- * cap, the clickable-ref cap, or the payload cap and marks `reason`. It does
- * not launch an activity.
+ * cap or the payload cap and marks `reason`. Clickable nodes past the ref cap
+ * stay in the tree; refs are assigned later, and only to clickable nodes.
+ * Each walk owns its `StringBuilder`. Nothing in the walk is shared across
+ * calls. It does not launch an activity.
  */
 
 internal class A11yCaps(
@@ -75,9 +77,9 @@ internal fun parseA11yCaps(json: String): A11yCaps? {
 
 internal fun walkA11y(root: A11yNodeView, caps: A11yCaps): WalkWire {
     val parts = ArrayList<String>(minOf(caps.maxNodes, 32))
+    val buf = StringBuilder(256)
     var reason = ""
     var stopped = false
-    var clickableKept = 0
     val reserve = envelopeBytes("payload")
     var used = reserve
     val stack = ArrayDeque<Visit>()
@@ -91,13 +93,8 @@ internal fun walkA11y(root: A11yNodeView, caps: A11yCaps): WalkWire {
                 stopped = true
                 break
             }
-            if (top.node.clickable && clickableKept >= caps.maxRefs) {
-                reason = "refs"
-                stopped = true
-                break
-            }
             val room = caps.payloadMaxBytes - used - if (parts.isEmpty()) 0 else 1
-            val rendered = renderWithin(top.node, top.path, room)
+            val rendered = renderWithin(top.node, top.path, room, buf)
             if (rendered == null) {
                 reason = "payload"
                 stopped = true
@@ -105,7 +102,6 @@ internal fun walkA11y(root: A11yNodeView, caps: A11yCaps): WalkWire {
             }
             used += rendered.json.toByteArray(Charsets.UTF_8).size + if (parts.isEmpty()) 0 else 1
             parts.add(rendered.json)
-            if (top.node.clickable) clickableKept += 1
             if (rendered.cut) {
                 reason = "payload"
                 stopped = true
@@ -220,23 +216,28 @@ private class Visit(
 
 private class Rendered(val json: String, val cut: Boolean)
 
-private fun renderWithin(node: A11yNodeView, path: IntArray, budget: Int): Rendered? {
+private fun renderWithin(
+    node: A11yNodeView,
+    path: IntArray,
+    budget: Int,
+    buf: StringBuilder,
+): Rendered? {
     if (budget <= 0) return null
     val cls = node.classPrefix(budget)
     val text = node.textPrefix(budget)
     val desc = node.descPrefix(budget)
     val id = node.idPrefix(budget)
     val pkg = node.pkgPrefix(budget)
-    val full = nodeJson(cls.text, text.text, desc.text, id.text, pkg.text, node, path)
+    val full = nodeJson(buf, cls.text, text.text, desc.text, id.text, pkg.text, node, path)
     if (utf8(full) <= budget) {
         val cut = cls.cut || text.cut || desc.cut || id.cut || pkg.cut
         return Rendered(full, cut)
     }
     val fitted = shrinkText(text.text, budget) { prefix ->
-        nodeJson(cls.text, prefix, desc.text, id.text, pkg.text, node, path)
+        nodeJson(buf, cls.text, prefix, desc.text, id.text, pkg.text, node, path)
     }
     if (fitted != null) return Rendered(fitted, cut = true)
-    val emptied = nodeJson("", "", "", "", "", node, path)
+    val emptied = nodeJson(buf, "", "", "", "", "", node, path)
     if (utf8(emptied) <= budget) return Rendered(emptied, cut = true)
     return null
 }
@@ -262,6 +263,7 @@ private fun shrinkText(text: String, budget: Int, render: (String) -> String): S
 }
 
 private fun nodeJson(
+    buf: StringBuilder,
     cls: String,
     text: String,
     desc: String,
@@ -270,31 +272,31 @@ private fun nodeJson(
     node: A11yNodeView,
     path: IntArray,
 ): String {
-    val sb = StringBuilder()
-    sb.append("{\"cls\":")
-    appendJson(sb, cls)
-    sb.append(",\"text\":")
-    appendJson(sb, text)
-    sb.append(",\"desc\":")
-    appendJson(sb, desc)
-    sb.append(",\"id\":")
-    appendJson(sb, id)
-    sb.append(",\"pkg\":")
-    appendJson(sb, pkg)
-    sb.append(",\"click\":")
-    sb.append(if (node.clickable) "true" else "false")
-    sb.append(",\"b\":[")
+    buf.setLength(0)
+    buf.append("{\"cls\":")
+    appendJson(buf, cls)
+    buf.append(",\"text\":")
+    appendJson(buf, text)
+    buf.append(",\"desc\":")
+    appendJson(buf, desc)
+    buf.append(",\"id\":")
+    appendJson(buf, id)
+    buf.append(",\"pkg\":")
+    appendJson(buf, pkg)
+    buf.append(",\"click\":")
+    buf.append(if (node.clickable) "true" else "false")
+    buf.append(",\"b\":[")
     node.bounds.forEachIndexed { i, v ->
-        if (i > 0) sb.append(',')
-        sb.append(v)
+        if (i > 0) buf.append(',')
+        buf.append(v)
     }
-    sb.append("],\"path\":[")
+    buf.append("],\"path\":[")
     path.forEachIndexed { i, v ->
-        if (i > 0) sb.append(',')
-        sb.append(v)
+        if (i > 0) buf.append(',')
+        buf.append(v)
     }
-    sb.append("]}")
-    return sb.toString()
+    buf.append("]}")
+    return buf.toString()
 }
 
 private fun assembleWire(reason: String, parts: List<String>): String {
