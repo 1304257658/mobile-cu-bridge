@@ -17,8 +17,65 @@ on:
       - "appimage/**"
       - "flatpak/**"
 
+# Do not call flutter-build.yml here. Its generate-sbom and
+# publish-signed-update-metadata jobs request contents: write, and this
+# repository's token is only allowed contents: read. That call fails at
+# startup, before GitHub creates any job in this file. Nightly and tag
+# workflows still call flutter-build.yml.
+
 jobs:
-  run-ci:
-    uses: ./.github/workflows/flutter-build.yml
-    with:
-      upload-artifact: false
+  semantic-set-text:
+    name: set_text read-back decision
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run set_text decision unit tests
+        run: bash flutter/android/semantic-set-text-test.sh
+
+  semantic-open-app:
+    name: open_app foreground decision
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run open_app foreground decision unit tests
+        run: bash flutter/android/semantic-apps-test.sh
+
+  semantic-peer-update:
+    name: peer apk cover-install decision
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run peer apk update decision unit tests
+        run: bash flutter/android/semantic-peer-update-test.sh
+
+  semantic-snapshot:
+    name: snapshot ref decisions
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: read
+    steps:
+      - name: Checkout source code
+        uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          persist-credentials: false
+
+      - name: Run snapshot walk unit tests
+        run: bash flutter/android/semantic-snapshot-test.sh

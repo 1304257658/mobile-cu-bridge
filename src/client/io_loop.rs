@@ -2575,8 +2575,11 @@ impl<T: InvokeUiSession> Remote<T> {
                         .handle_screenshot_resp(response.sid, response.msg);
                 }
                 Some(message::Union::SemanticActionResult(result)) => {
-                    self.handler
-                        .note_semantic_result(&result.kind, &result.code);
+                    self.handler.note_semantic_result(
+                        &result.kind,
+                        &result.code,
+                        &result.detail,
+                    );
                 }
                 Some(message::Union::TerminalResponse(response)) => {
                     use base::message_proto::terminal_response::Union;

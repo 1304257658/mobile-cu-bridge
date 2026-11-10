@@ -1,0 +1,10 @@
+{
+  "max_refs": 80,
+  "max_nodes": 256,
+  "payload_max_bytes": 32768,
+  "snapshot_timeout_ms": 1500,
+  "click_timeout_ms": 1000,
+  "ref_ttl_ms": 5000,
+  "flight_lease_ms": 5000,
+  "batch_max": 8
+}
