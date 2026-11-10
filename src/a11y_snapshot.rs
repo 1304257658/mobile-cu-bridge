@@ -12,11 +12,14 @@
 //! previous-generation, or moved ref is `ref_stale`. No other result code is
 //! added for this path.
 //!
-//! Snapshot and click share one in-flight flag and at most one worker thread.
-//! A busy call returns `snapshot_failed` without starting a thread. The worker
-//! clears the flag when it finishes. A timeout reply does not clear it, so a
-//! stuck call cannot be stacked. Refs look like `g7.n3`: the generation
-//! changes on every installed snapshot, and only clickable nodes get a ref.
+//! Snapshot and click share one in-flight lease (`flight_lease_ms`). A call
+//! that arrives while the lease is still held returns `snapshot_failed` and
+//! starts no thread. After the lease, the next call reclaims the slot, marks
+//! the stuck worker abandoned, and drops that worker's late result. An
+//! abandoned worker does not clear the new lease. At most one abandoned
+//! worker stays alive; a further stuck call logs `a11y wedged` and does not
+//! start a third thread. Refs look like `g7.n3`: the generation changes on
+//! every installed snapshot, and only clickable nodes get a ref.
 
 use crate::semantic_action::{
     result_message, result_message_with_detail, validate, CLICK, OK, REF_STALE, SNAPSHOT,
@@ -28,15 +31,15 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
-        mpsc, Arc, Mutex, OnceLock,
+        atomic::{AtomicU64, AtomicUsize, Ordering},
+        mpsc, Arc, Condvar, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
 
-/// One accessibility worker thread at a time. The timeout reply is not a thread.
-const A11Y_WORKER_CAP: usize = 1;
+/// Current worker plus at most one abandoned worker. The timeout reply is not a thread.
+const A11Y_THREAD_CAP: usize = 2;
 
 const CAPS_JSON: &str =
     include_str!("../flutter/android/app/src/main/assets/a11y_snapshot_caps.json");
@@ -50,6 +53,7 @@ pub struct Caps {
     pub snapshot_timeout_ms: u64,
     pub click_timeout_ms: u64,
     pub ref_ttl_ms: u64,
+    pub flight_lease_ms: u64,
     pub batch_max: usize,
 }
 
@@ -102,30 +106,62 @@ impl Outcome {
 
 pub struct Peer {
     caps: Caps,
-    running: Arc<AtomicBool>,
+    flight: Arc<Mutex<Flight>>,
     live_workers: Arc<AtomicUsize>,
+    peak_workers: Arc<AtomicUsize>,
     spawns: Arc<AtomicUsize>,
     gen: AtomicU64,
     table: Mutex<RefTable>,
 }
 
-struct WorkerGuard {
-    flag: Arc<AtomicBool>,
+struct Flight {
+    next: u64,
+    holder: u64,
+    since: Instant,
+    abandoned: u64,
+}
+
+struct Permit {
+    token: u64,
+    counted: bool,
+    settled: bool,
+    flight: Arc<Mutex<Flight>>,
     live: Arc<AtomicUsize>,
 }
 
-impl Drop for WorkerGuard {
-    fn drop(&mut self) {
-        self.live.fetch_sub(1, Ordering::AcqRel);
-        self.flag.store(false, Ordering::Release);
+impl Permit {
+    fn token(&self) -> u64 {
+        self.token
+    }
+
+    /// Drop the lease. `true` only when this worker still owns it, so a late
+    /// result from an abandoned worker is not delivered and does not clear
+    /// the replacement lease.
+    fn conclude(&mut self) -> bool {
+        if self.settled {
+            return false;
+        }
+        self.settled = true;
+        if self.counted {
+            self.live.fetch_sub(1, Ordering::AcqRel);
+            self.counted = false;
+        }
+        let mut flight = self.flight.lock().unwrap();
+        if flight.abandoned == self.token {
+            flight.abandoned = 0;
+            return false;
+        }
+        if flight.holder == self.token {
+            flight.holder = 0;
+            return true;
+        }
+        false
     }
 }
 
-struct FlagGuard(Arc<AtomicBool>);
-
-impl Drop for FlagGuard {
+impl Drop for Permit {
     fn drop(&mut self) {
-        self.0.store(false, Ordering::Release);
+        let _ = self.conclude();
     }
 }
 
@@ -174,8 +210,14 @@ impl Peer {
     pub fn new(caps: Caps) -> Self {
         Self {
             caps,
-            running: Arc::new(AtomicBool::new(false)),
+            flight: Arc::new(Mutex::new(Flight {
+                next: 0,
+                holder: 0,
+                since: Instant::now(),
+                abandoned: 0,
+            })),
             live_workers: Arc::new(AtomicUsize::new(0)),
+            peak_workers: Arc::new(AtomicUsize::new(0)),
             spawns: Arc::new(AtomicUsize::new(0)),
             gen: AtomicU64::new(0),
             table: Mutex::new(RefTable {
@@ -188,40 +230,61 @@ impl Peer {
         self.spawns.load(Ordering::Acquire)
     }
 
-    fn try_begin(&self) -> bool {
-        self.running
-            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
+    fn worker_peak(&self) -> usize {
+        self.peak_workers.load(Ordering::Acquire)
     }
 
-    fn end(&self) {
-        self.running.store(false, Ordering::Release);
-    }
-
-    /// Start the one worker. `work` owns the guard and drops it when the
-    /// action is finished. A `false` return starts nothing.
-    fn try_spawn<F>(&self, work: F) -> bool
-    where
-        F: FnOnce(WorkerGuard) + Send + 'static,
-    {
-        if !self.try_begin() {
-            log::error!("semantic a11y refused: one action is already running");
-            return false;
+    fn acquire(&self, now: Instant) -> Result<Permit, ()> {
+        let mut flight = self.flight.lock().unwrap();
+        let lease = Duration::from_millis(self.caps.flight_lease_ms);
+        let live = self.live_workers.load(Ordering::Acquire);
+        if flight.holder != 0 {
+            let expired = now.saturating_duration_since(flight.since) >= lease;
+            if !expired {
+                log::error!("semantic a11y refused: one action is already running");
+                return Err(());
+            }
+            if flight.abandoned != 0 || live >= A11Y_THREAD_CAP {
+                log::error!("a11y wedged");
+                return Err(());
+            }
+            flight.abandoned = flight.holder;
+        } else if live >= A11Y_THREAD_CAP {
+            log::error!("a11y wedged");
+            return Err(());
         }
-        let live = self.live_workers.fetch_add(1, Ordering::AcqRel);
-        if live >= A11Y_WORKER_CAP {
-            self.live_workers.fetch_sub(1, Ordering::AcqRel);
-            self.end();
-            log::error!("semantic a11y refused: worker cap {A11Y_WORKER_CAP}");
-            return false;
-        }
-        let guard = WorkerGuard {
-            flag: Arc::clone(&self.running),
+        flight.next = flight.next.saturating_add(1);
+        let token = flight.next;
+        flight.holder = token;
+        flight.since = now;
+        Ok(Permit {
+            token,
+            counted: false,
+            settled: false,
+            flight: Arc::clone(&self.flight),
             live: Arc::clone(&self.live_workers),
+        })
+    }
+
+    fn still_current(&self, token: u64) -> bool {
+        self.flight.lock().unwrap().holder == token
+    }
+
+    /// Start at most one new worker. `false` starts nothing.
+    fn try_spawn<F>(&self, now: Instant, work: F) -> bool
+    where
+        F: FnOnce(Permit) + Send + 'static,
+    {
+        let mut permit = match self.acquire(now) {
+            Ok(permit) => permit,
+            Err(()) => return false,
         };
+        let n = self.live_workers.fetch_add(1, Ordering::AcqRel) + 1;
+        self.peak_workers.fetch_max(n, Ordering::AcqRel);
+        permit.counted = true;
         match thread::Builder::new()
             .name("a11y-action".into())
-            .spawn(move || work(guard))
+            .spawn(move || work(permit))
         {
             Ok(_) => {
                 self.spawns.fetch_add(1, Ordering::AcqRel);
@@ -241,24 +304,27 @@ impl Peer {
         let (tx, rx) = mpsc::channel();
         let (ack_tx, ack_rx) = mpsc::channel::<()>();
         let (done_tx, done_rx) = mpsc::channel::<()>();
-        if !self.try_spawn(move |guard| {
+        if !self.try_spawn(now, move |mut permit| {
+            let token = permit.token();
             let result = collect();
-            let _ = tx.send(result);
+            let _ = tx.send((token, result));
             let _ = ack_rx.recv();
-            drop(guard);
+            permit.conclude();
             let _ = done_tx.send(());
         }) {
             return Outcome::fail();
         }
         let timeout = Duration::from_millis(self.caps.snapshot_timeout_ms);
         match rx.recv_timeout(timeout) {
-            Ok(Ok(collected)) => {
-                let outcome = self.publish(collected, now);
+            Ok((token, Ok(collected))) => {
+                let outcome = self
+                    .publish_if_current(token, collected, now)
+                    .unwrap_or_else(Outcome::fail);
                 let _ = ack_tx.send(());
                 let _ = done_rx.recv();
                 outcome
             }
-            Ok(Err(code)) => {
+            Ok((_, Err(code))) => {
                 let _ = ack_tx.send(());
                 let _ = done_rx.recv();
                 Outcome {
@@ -290,12 +356,16 @@ impl Peer {
             Ok(targets) => targets,
             Err(code) => return code,
         };
-        if !self.try_begin() {
-            log::error!("semantic click refused: one action is already running");
-            return SNAPSHOT_FAILED;
+        let mut permit = match self.acquire(now) {
+            Ok(permit) => permit,
+            Err(()) => return SNAPSHOT_FAILED,
+        };
+        let code = perform_all(&targets, &mut perform);
+        if permit.conclude() {
+            code
+        } else {
+            SNAPSHOT_FAILED
         }
-        let _guard = FlagGuard(Arc::clone(&self.running));
-        perform_all(&targets, &mut perform)
     }
 
     fn click_timed<F>(&self, arg: &str, now: Instant, mut perform: F) -> &'static str
@@ -307,10 +377,11 @@ impl Peer {
             Err(code) => return code,
         };
         let (tx, rx) = mpsc::channel();
-        if !self.try_spawn(move |guard| {
+        if !self.try_spawn(now, move |mut permit| {
             let code = perform_all(&targets, &mut perform);
-            drop(guard);
-            let _ = tx.send(code);
+            if permit.conclude() {
+                let _ = tx.send(code);
+            }
         }) {
             return SNAPSHOT_FAILED;
         }
@@ -321,6 +392,19 @@ impl Peer {
                 SNAPSHOT_FAILED
             }
         }
+    }
+
+    fn publish_if_current(
+        &self,
+        token: u64,
+        collected: Collected,
+        now: Instant,
+    ) -> Option<Outcome> {
+        let current = self.flight.lock().unwrap().holder == token;
+        if !current {
+            return None;
+        }
+        Some(self.publish(collected, now))
     }
 
     fn publish(&self, collected: Collected, now: Instant) -> Outcome {
@@ -641,7 +725,7 @@ fn parse_caps(text: &str) -> Result<Caps, String> {
     let obj = value
         .as_object()
         .ok_or_else(|| "caps json is not an object".to_owned())?;
-    if obj.len() != 7 {
+    if obj.len() != 8 {
         return Err(format!("caps json has {} fields", obj.len()));
     }
     Ok(Caps {
@@ -651,6 +735,7 @@ fn parse_caps(text: &str) -> Result<Caps, String> {
         snapshot_timeout_ms: field_u64(obj, "snapshot_timeout_ms")?,
         click_timeout_ms: field_u64(obj, "click_timeout_ms")?,
         ref_ttl_ms: field_u64(obj, "ref_ttl_ms")?,
+        flight_lease_ms: field_u64(obj, "flight_lease_ms")?,
         batch_max: field(obj, "batch_max")?,
     })
 }
@@ -920,23 +1005,30 @@ pub fn dispatch(kind: String, arg: String, send: impl FnOnce(Message) + Send + '
                 send(result_message(CLICK, code));
                 return;
             }
-            Ok(targets) => peer.try_spawn(move |guard| {
+            Ok(targets) => peer.try_spawn(Instant::now(), move |mut permit| {
                 let code = perform_all(&targets, &mut perform_clicks);
-                drop(guard);
-                let _ = tx.blocking_send(result_message(CLICK, code));
+                if permit.conclude() {
+                    let _ = tx.blocking_send(result_message(CLICK, code));
+                }
             }),
         }
     } else {
-        peer.try_spawn(move |guard| {
+        peer.try_spawn(Instant::now(), move |mut permit| {
+            let token = permit.token();
             let outcome = match collect_tree() {
-                Ok(collected) => peer.publish(collected, Instant::now()),
-                Err(code) => Outcome {
+                Ok(collected) => peer
+                    .publish_if_current(token, collected, Instant::now())
+                    .unwrap_or_else(Outcome::fail),
+                Err(code) if peer.still_current(token) => Outcome {
                     code,
                     detail: String::new(),
                 },
+                Err(_) => Outcome::fail(),
             };
-            drop(guard);
-            let _ = tx.blocking_send(to_message(SNAPSHOT, &outcome));
+            let keep = permit.conclude();
+            if keep {
+                let _ = tx.blocking_send(to_message(SNAPSHOT, &outcome));
+            }
         })
     };
     if !started {
@@ -990,17 +1082,70 @@ fn admit(kind: &str, arg: &str) -> Option<Message> {
     }
 }
 
-#[cfg(target_os = "android")]
-fn a11y_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: Mutex<()> = Mutex::new(());
-    LOCK.lock().unwrap_or_else(|e| e.into_inner())
+struct A11yGate {
+    held: Mutex<bool>,
+    cv: Condvar,
+}
+
+struct A11yGuard;
+
+impl Drop for A11yGuard {
+    fn drop(&mut self) {
+        let gate = a11y_gate();
+        let mut held = gate.held.lock().unwrap_or_else(|err| err.into_inner());
+        *held = false;
+        gate.cv.notify_one();
+    }
+}
+
+fn a11y_gate() -> &'static A11yGate {
+    static GATE: OnceLock<A11yGate> = OnceLock::new();
+    GATE.get_or_init(|| A11yGate {
+        held: Mutex::new(false),
+        cv: Condvar::new(),
+    })
+}
+
+/// Wait only until `budget`. A holder stuck inside the critical section is not
+/// preempted: this returns `None` and the caller reports `snapshot_failed`.
+fn a11y_lock_for(budget: Duration) -> Option<A11yGuard> {
+    let gate = a11y_gate();
+    let deadline = Instant::now() + budget;
+    let mut held = gate.held.lock().unwrap_or_else(|err| err.into_inner());
+    loop {
+        if !*held {
+            *held = true;
+            return Some(A11yGuard);
+        }
+        let now = Instant::now();
+        if now >= deadline {
+            return None;
+        }
+        let (guard, status) = gate
+            .cv
+            .wait_timeout(held, deadline.saturating_duration_since(now))
+            .unwrap_or_else(|err| err.into_inner());
+        held = guard;
+        if status.timed_out() && *held {
+            return None;
+        }
+    }
 }
 
 #[cfg(target_os = "android")]
 fn collect_tree() -> Result<Collected, &'static str> {
-    let _guard = a11y_lock();
     let caps = caps().map_err(|_| SNAPSHOT_FAILED)?;
-    match scrap::android::call_main_service_semantic_action(SNAPSHOT, "") {
+    let raw = {
+        let _guard = match a11y_lock_for(Duration::from_millis(caps.snapshot_timeout_ms)) {
+            Some(guard) => guard,
+            None => {
+                log::error!("semantic snapshot a11y lock busy");
+                return Err(SNAPSHOT_FAILED);
+            }
+        };
+        scrap::android::call_main_service_semantic_action(SNAPSHOT, "")
+    };
+    match raw {
         Ok(raw) => parse_wire(&raw, &caps),
         Err(e) => {
             log::error!("semantic snapshot jni failed: {e}");
@@ -1036,8 +1181,18 @@ fn perform_clicks(target: &Target) -> &'static str {
 
 #[cfg(target_os = "android")]
 fn perform_click_android(target: &Target) -> &'static str {
-    let _guard = a11y_lock();
     let arg = encode_target(target);
+    let caps = match caps() {
+        Ok(caps) => caps,
+        Err(_) => return SNAPSHOT_FAILED,
+    };
+    let _guard = match a11y_lock_for(Duration::from_millis(caps.click_timeout_ms)) {
+        Some(guard) => guard,
+        None => {
+            log::error!("semantic click a11y lock busy");
+            return SNAPSHOT_FAILED;
+        }
+    };
     match scrap::android::call_main_service_semantic_action(CLICK, &arg) {
         Ok(code) if code == OK => OK,
         Ok(code) if code == REF_STALE => REF_STALE,
@@ -1109,7 +1264,8 @@ mod tests {
     fn caps_json_is_the_contract() {
         let caps = caps_ok();
         assert_eq!(caps.max_refs, 80);
-        assert_eq!(A11Y_WORKER_CAP, 1);
+        assert_eq!(A11Y_THREAD_CAP, 2);
+        assert_eq!(caps.flight_lease_ms, 5_000);
         assert_eq!(caps.max_nodes, 256);
         assert_eq!(caps.payload_max_bytes, 32 * 1024);
         assert_eq!(caps.snapshot_timeout_ms, 1_500);
@@ -1442,12 +1598,112 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let started = peer.threads_started();
         assert_eq!(started, before + 1);
-        assert!(peer.live_workers.load(Ordering::Acquire) <= A11Y_WORKER_CAP);
+        assert_eq!(peer.live_workers.load(Ordering::Acquire), 1);
+        assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
         let code = peer.click_timed("g1.n0", now, |_| panic!("busy click started work"));
         assert_eq!(code, SNAPSHOT_FAILED);
         assert_eq!(peer.threads_started(), started);
         release_tx.send(()).unwrap();
         assert_eq!(worker.join().unwrap(), OK);
+    }
+
+    /// The injected worker blocks in `collect`, before `a11y_lock`. After
+    /// `flight_lease_ms` a new snapshot is `ok` and the late tree is dropped.
+    /// A second abandoned worker is refused (`a11y wedged`) so live threads
+    /// stay at or below `A11Y_THREAD_CAP`. A hang inside the lock is not
+    /// recovered: `a11y_lock_for` returns `None` until that call returns.
+    #[test]
+    fn an_expired_lease_recovers_without_a_third_thread() {
+        let peer = Arc::new(peer());
+        let t0 = Instant::now();
+        let lease = Duration::from_millis(peer.caps.flight_lease_ms);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let stuck_peer = Arc::clone(&peer);
+        let stuck = thread::spawn(move || {
+            stuck_peer.snapshot_with(t0, move || {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                Ok(collect(vec![sample("LATE", vec![0], [1, 1, 2, 2])]))
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let during = t0 + lease - Duration::from_millis(1);
+        let held = peer.threads_started();
+        assert_eq!(
+            peer.snapshot_with(during, || panic!("request inside the lease"))
+                .code,
+            SNAPSHOT_FAILED
+        );
+        assert_eq!(peer.threads_started(), held);
+        assert_eq!(peer.live_workers.load(Ordering::Acquire), 1);
+        assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
+
+        let after = t0 + lease;
+        let fresh = peer.snapshot_with(after, || {
+            Ok(collect(vec![sample("FRESH", vec![0], [9, 9, 19, 19])]))
+        });
+        assert_eq!(fresh.code, OK);
+        assert!(fresh.detail.contains("FRESH"));
+        assert!(!fresh.detail.contains("LATE"));
+        assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
+        let mut saw = [0; 4];
+        assert_eq!(
+            peer.click_at("g1.n0", after, |target| {
+                saw = target.bounds;
+                OK
+            }),
+            OK
+        );
+        assert_eq!(saw, [9, 9, 19, 19]);
+
+        let (again_tx, again_rx) = mpsc::channel();
+        let (release_again_tx, release_again_rx) = mpsc::channel::<()>();
+        let again_peer = Arc::clone(&peer);
+        let again = thread::spawn(move || {
+            again_peer.snapshot_with(after, move || {
+                again_tx.send(()).unwrap();
+                let _ = release_again_rx.recv();
+                Ok(collect(vec![sample("LATE2", vec![0], [3, 3, 4, 4])]))
+            })
+        });
+        again_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let before_wedge = peer.threads_started();
+        assert_eq!(
+            peer.snapshot_with(after + lease, || panic!("third worker"))
+                .code,
+            SNAPSHOT_FAILED
+        );
+        assert_eq!(peer.threads_started(), before_wedge);
+        assert!(peer.live_workers.load(Ordering::Acquire) <= A11Y_THREAD_CAP);
+        assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(stuck.join().unwrap().code, SNAPSHOT_FAILED);
+        release_again_tx.send(()).unwrap();
+        let _ = again.join().unwrap();
+        assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
+    }
+
+    #[test]
+    fn a11y_lock_wait_is_bounded_by_the_request_budget() {
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let (held_tx, held_rx) = mpsc::channel();
+        let holder = thread::spawn(move || {
+            let guard = a11y_lock_for(Duration::from_secs(5)).expect("lock");
+            held_tx.send(()).unwrap();
+            let _ = release_rx.recv();
+            drop(guard);
+        });
+        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = Instant::now();
+        assert!(a11y_lock_for(Duration::from_millis(80)).is_none());
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(70));
+        assert!(waited < Duration::from_millis(500));
+        release_tx.send(()).unwrap();
+        holder.join().unwrap();
+        assert!(a11y_lock_for(Duration::from_millis(200)).is_some());
     }
 
     #[test]

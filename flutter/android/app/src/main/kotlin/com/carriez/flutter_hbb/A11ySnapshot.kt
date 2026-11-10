@@ -18,6 +18,7 @@ internal class A11yCaps(
     val snapshotTimeoutMs: Long,
     val clickTimeoutMs: Long,
     val refTtlMs: Long,
+    val flightLeaseMs: Long,
     val batchMax: Int,
 )
 
@@ -49,7 +50,7 @@ internal fun parseA11yCaps(json: String): A11yCaps? {
     val body = json.trim()
     if (body.length < 2 || body.first() != '{' || body.last() != '}') return null
     val parts = body.substring(1, body.length - 1).split(',')
-    if (parts.size != 7) return null
+    if (parts.size != 8) return null
     val map = HashMap<String, Long>(8)
     for (part in parts) {
         val pair = part.split(':', limit = 2)
@@ -59,7 +60,7 @@ internal fun parseA11yCaps(json: String): A11yCaps? {
         if (value <= 0L || value > Int.MAX_VALUE) return null
         if (map.put(key, value) != null) return null
     }
-    if (map.size != 7) return null
+    if (map.size != 8) return null
     return A11yCaps(
         maxRefs = map["max_refs"]?.toInt() ?: return null,
         maxNodes = map["max_nodes"]?.toInt() ?: return null,
@@ -67,6 +68,7 @@ internal fun parseA11yCaps(json: String): A11yCaps? {
         snapshotTimeoutMs = map["snapshot_timeout_ms"] ?: return null,
         clickTimeoutMs = map["click_timeout_ms"] ?: return null,
         refTtlMs = map["ref_ttl_ms"] ?: return null,
+        flightLeaseMs = map["flight_lease_ms"] ?: return null,
         batchMax = map["batch_max"]?.toInt() ?: return null,
     )
 }

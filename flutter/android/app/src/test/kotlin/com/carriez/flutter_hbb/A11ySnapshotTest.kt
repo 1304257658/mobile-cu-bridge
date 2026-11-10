@@ -19,6 +19,7 @@ class A11ySnapshotTest {
         assertEquals(1500L, caps.snapshotTimeoutMs)
         assertEquals(1000L, caps.clickTimeoutMs)
         assertEquals(5000L, caps.refTtlMs)
+        assertEquals(5000L, caps.flightLeaseMs)
         assertEquals(8, caps.batchMax)
         assertNull(parseA11yCaps("{\"max_refs\": 80}"))
         val extra = File(System.getProperty("a11y.caps")).readText().replace("}", ",\"fg\": 1}")
