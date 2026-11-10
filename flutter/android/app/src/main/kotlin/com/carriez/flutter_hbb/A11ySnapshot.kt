@@ -7,11 +7,12 @@ import java.util.ArrayDeque
  * unit test can run without an SDK.
  *
  * Numbers come only from `a11y_snapshot_caps.json`. A walk stops at the node
- * cap or the payload cap and marks `reason`. It does not launch an activity.
+ * cap, the clickable-ref cap, or the payload cap and marks `reason`. It does
+ * not launch an activity.
  */
 
 internal class A11yCaps(
-    val refMaxLen: Int,
+    val maxRefs: Int,
     val maxNodes: Int,
     val payloadMaxBytes: Int,
     val snapshotTimeoutMs: Long,
@@ -60,7 +61,7 @@ internal fun parseA11yCaps(json: String): A11yCaps? {
     }
     if (map.size != 7) return null
     return A11yCaps(
-        refMaxLen = map["ref_max_len"]?.toInt() ?: return null,
+        maxRefs = map["max_refs"]?.toInt() ?: return null,
         maxNodes = map["max_nodes"]?.toInt() ?: return null,
         payloadMaxBytes = map["payload_max_bytes"]?.toInt() ?: return null,
         snapshotTimeoutMs = map["snapshot_timeout_ms"] ?: return null,
@@ -74,6 +75,7 @@ internal fun walkA11y(root: A11yNodeView, caps: A11yCaps): WalkWire {
     val parts = ArrayList<String>(minOf(caps.maxNodes, 32))
     var reason = ""
     var stopped = false
+    var clickableKept = 0
     val reserve = envelopeBytes("payload")
     var used = reserve
     val stack = ArrayDeque<Visit>()
@@ -87,6 +89,11 @@ internal fun walkA11y(root: A11yNodeView, caps: A11yCaps): WalkWire {
                 stopped = true
                 break
             }
+            if (top.node.clickable && clickableKept >= caps.maxRefs) {
+                reason = "refs"
+                stopped = true
+                break
+            }
             val room = caps.payloadMaxBytes - used - if (parts.isEmpty()) 0 else 1
             val rendered = renderWithin(top.node, top.path, room)
             if (rendered == null) {
@@ -96,6 +103,7 @@ internal fun walkA11y(root: A11yNodeView, caps: A11yCaps): WalkWire {
             }
             used += rendered.json.toByteArray(Charsets.UTF_8).size + if (parts.isEmpty()) 0 else 1
             parts.add(rendered.json)
+            if (top.node.clickable) clickableKept += 1
             if (rendered.cut) {
                 reason = "payload"
                 stopped = true
@@ -126,6 +134,25 @@ internal fun walkA11y(root: A11yNodeView, caps: A11yCaps): WalkWire {
     }
     if (!stopped) reason = ""
     return WalkWire(assembleWire(reason, parts), reason, parts.size)
+}
+
+internal fun clickBoundsCode(expected: IntArray, actual: IntArray): String {
+    if (expected.size != 4 || actual.size != 4 || !expected.contentEquals(actual)) {
+        return "ref_stale"
+    }
+    return "ok"
+}
+
+internal fun applyClick(root: A11yNodeView, target: ClickTarget): String {
+    val node = nodeAt(root, target.path) ?: return "snapshot_failed"
+    val code = clickBoundsCode(target.bounds, node.bounds)
+    if (code != "ok") {
+        if (node !== root) node.recycle()
+        return code
+    }
+    val clicked = node.performClick()
+    if (node !== root) node.recycle()
+    return if (clicked) "ok" else "snapshot_failed"
 }
 
 internal fun nodeAt(root: A11yNodeView, path: IntArray): A11yNodeView? {

@@ -1,5 +1,5 @@
 {
-  "ref_max_len": 80,
+  "max_refs": 80,
   "max_nodes": 256,
   "payload_max_bytes": 32768,
   "snapshot_timeout_ms": 1500,

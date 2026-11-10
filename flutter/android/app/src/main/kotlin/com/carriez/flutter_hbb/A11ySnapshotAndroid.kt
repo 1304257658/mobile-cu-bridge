@@ -61,16 +61,14 @@ internal fun semanticClick(context: Context, root: AccessibilityNodeInfo?, arg: 
     val view = AndroidNode(root)
     try {
         for (target in targets) {
-            val node = nodeAt(view, target.path)
-            if (node == null) {
-                Log.e(SNAPSHOT_TAG, "click path missing")
-                return "snapshot_failed"
-            }
-            val ok = node.bounds.contentEquals(target.bounds) && node.performClick()
-            if (node !== view) node.recycle()
-            if (!ok) {
-                Log.e(SNAPSHOT_TAG, "click action failed")
-                return "snapshot_failed"
+            val code = applyClick(view, target)
+            if (code != "ok") {
+                if (code == "ref_stale") {
+                    Log.e(SNAPSHOT_TAG, "click bounds changed")
+                } else {
+                    Log.e(SNAPSHOT_TAG, "click action failed")
+                }
+                return code
             }
         }
         return "ok"

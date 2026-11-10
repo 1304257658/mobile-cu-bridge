@@ -1022,7 +1022,8 @@ message SemanticActionResult {
   // list_apps JSON: {"items":[{"package","label","activity"}],"truncated"}.
   // label and activity are strings or null.
   // snapshot JSON: {"truncated","reason","nodes":[{"ref","cls","text","desc",
-  // "id","pkg","click","b"}]}. reason is "", "nodes", or "payload".
+  // "id","pkg","click","b"}]}. ref is g<gen>.n<index>. reason is "", "nodes",
+  // "payload", or "refs". Only clickable nodes are listed, at most 80.
   // Empty for every other kind.
   string detail = 3;
 }

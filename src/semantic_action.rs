@@ -1058,17 +1058,17 @@ mod tests {
         assert_eq!(gate(&ready, SNAPSHOT, ""), OK);
         assert_eq!(gate(&ready, SNAPSHOT, "com.sankuai.meituan"), UNSUPPORTED);
         assert_eq!(gate(&desktop("Windows"), SNAPSHOT, ""), UNSUPPORTED);
-        assert_eq!(gate(&ready, CLICK, "n0"), OK);
+        assert_eq!(gate(&ready, CLICK, "g1.n0"), OK);
         let nine = format!(
             "[{}]",
             (0..9)
-                .map(|i| format!("\"n{i}\""))
+                .map(|i| format!("\"g1.n{i}\""))
                 .collect::<Vec<_>>()
                 .join(",")
         );
         assert_eq!(gate(&ready, CLICK, &nine), SNAPSHOT_FAILED);
         assert_eq!(execute_on_peer(SNAPSHOT, ""), SNAPSHOT_FAILED);
-        assert_eq!(execute_on_peer(CLICK, "n0"), SNAPSHOT_FAILED);
+        assert_eq!(execute_on_peer(CLICK, "g1.n0"), SNAPSHOT_FAILED);
         for code in [SNAPSHOT_FAILED, REF_STALE] {
             assert_eq!(normalize_peer_code(code), code, "{code}");
             assert_ne!(code, INJECT_FAILED);

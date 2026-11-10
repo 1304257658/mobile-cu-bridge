@@ -13,14 +13,14 @@ class A11ySnapshotTest {
 
     @Test
     fun capsFileIsTheContract() {
-        assertEquals(80, caps.refMaxLen)
+        assertEquals(80, caps.maxRefs)
         assertEquals(256, caps.maxNodes)
         assertEquals(32 * 1024, caps.payloadMaxBytes)
         assertEquals(1500L, caps.snapshotTimeoutMs)
         assertEquals(1000L, caps.clickTimeoutMs)
         assertEquals(5000L, caps.refTtlMs)
         assertEquals(8, caps.batchMax)
-        assertNull(parseA11yCaps("{\"ref_max_len\": 80}"))
+        assertNull(parseA11yCaps("{\"max_refs\": 80}"))
         val extra = File(System.getProperty("a11y.caps")).readText().replace("}", ",\"fg\": 1}")
         assertNull(parseA11yCaps(extra))
     }
@@ -91,6 +91,31 @@ class A11ySnapshotTest {
     }
 
     @Test
+    fun movedBoundsAreStaleAndDoNotClick() {
+        val node = CountingNode(clickable = true, bounds = intArrayOf(0, 0, 10, 10))
+        val moved = ClickTarget(IntArray(0), intArrayOf(0, 0, 10, 11))
+        assertEquals("ref_stale", applyClick(node, moved))
+        assertFalse(node.clicked)
+        val same = ClickTarget(IntArray(0), intArrayOf(0, 0, 10, 10))
+        assertEquals("ok", applyClick(node, same))
+        assertTrue(node.clicked)
+    }
+
+    @Test
+    fun refCapStopsAfterEightyClickableNodes() {
+        val kids = ArrayList<CountingNode>(81)
+        for (i in 0 until 81) {
+            kids.add(CountingNode(text = "c$i", clickable = true, bounds = intArrayOf(0, i, 1, i + 1)))
+        }
+        val root = CountingNode(text = "root", children = kids)
+        val wire = walkA11y(root, caps)
+        assertEquals("refs", wire.reason)
+        assertTrue(wire.json.contains("\"truncated\":true"))
+        assertFalse(wire.json.contains("\"text\":\"c80\""))
+        assertEquals(caps.maxRefs + 1, root.childCalls)
+    }
+
+    @Test
     fun batchOverTheCapIsRejected() {
         val one = "{\"path\":[0],\"b\":[0,1,2,3]}"
         val eight = "[" + (1..8).joinToString(",") { one } + "]"
@@ -114,6 +139,7 @@ private class CountingNode(
 ) : A11yNodeView {
     var childCalls: Int = 0
     var recycled: Boolean = false
+    var clicked: Boolean = false
 
     override fun classPrefix(maxBytes: Int) = prefixOf(className, maxBytes)
     override fun textPrefix(maxBytes: Int) = prefixOf(text, maxBytes)
@@ -126,7 +152,10 @@ private class CountingNode(
         childCalls += 1
         return children.getOrNull(index)
     }
-    override fun performClick(): Boolean = clickable
+    override fun performClick(): Boolean {
+        clicked = true
+        return clickable
+    }
     override fun recycle() {
         recycled = true
     }

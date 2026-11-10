@@ -6,15 +6,17 @@
 //! Package and MAIN/LAUNCHER stay on `open_app`.
 //!
 //! Every limit is read from `flutter/android/app/src/main/assets/a11y_snapshot_caps.json`.
-//! A snapshot that exceeds the payload or the node cap is `ok` with
-//! `truncated: true` and `reason` `payload` or `nodes`. Anything that cannot
-//! produce a snapshot is `snapshot_failed`. An unknown or expired ref is
-//! `ref_stale`. No other result code is added for this path.
+//! A snapshot that exceeds the payload, the node cap, or the ref count is `ok`
+//! with `truncated: true` and `reason` `payload`, `nodes`, or `refs`. Anything
+//! that cannot produce a snapshot is `snapshot_failed`. An unknown, expired,
+//! previous-generation, or moved ref is `ref_stale`. No other result code is
+//! added for this path.
 //!
-//! One snapshot walk runs at a time. The walk sits on its own thread with a
-//! hard timeout, and the session loop is not held. A click that misses its
-//! deadline is `snapshot_failed`; a perform already inside the accessibility
-//! service can still land.
+//! Snapshot and click share one in-flight flag and at most one worker thread.
+//! A busy call returns `snapshot_failed` without starting a thread. The worker
+//! clears the flag when it finishes. A timeout reply does not clear it, so a
+//! stuck call cannot be stacked. Refs look like `g7.n3`: the generation
+//! changes on every installed snapshot, and only clickable nodes get a ref.
 
 use crate::semantic_action::{
     result_message, result_message_with_detail, validate, CLICK, OK, REF_STALE, SNAPSHOT,
@@ -26,19 +28,23 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
 };
 
+/// One accessibility worker thread at a time. The timeout reply is not a thread.
+const A11Y_WORKER_CAP: usize = 1;
+
 const CAPS_JSON: &str =
     include_str!("../flutter/android/app/src/main/assets/a11y_snapshot_caps.json");
 
 #[derive(Clone, Copy)]
 pub struct Caps {
-    pub ref_max_len: usize,
+    /// Clickable nodes that receive a ref. Not a string length.
+    pub max_refs: usize,
     pub max_nodes: usize,
     pub payload_max_bytes: usize,
     pub snapshot_timeout_ms: u64,
@@ -97,12 +103,27 @@ impl Outcome {
 pub struct Peer {
     caps: Caps,
     running: Arc<AtomicBool>,
+    live_workers: Arc<AtomicUsize>,
+    spawns: Arc<AtomicUsize>,
+    gen: AtomicU64,
     table: Mutex<RefTable>,
 }
 
-struct ClearOnDrop(Arc<AtomicBool>);
+struct WorkerGuard {
+    flag: Arc<AtomicBool>,
+    live: Arc<AtomicUsize>,
+}
 
-impl Drop for ClearOnDrop {
+impl Drop for WorkerGuard {
+    fn drop(&mut self) {
+        self.live.fetch_sub(1, Ordering::AcqRel);
+        self.flag.store(false, Ordering::Release);
+    }
+}
+
+struct FlagGuard(Arc<AtomicBool>);
+
+impl Drop for FlagGuard {
     fn drop(&mut self) {
         self.0.store(false, Ordering::Release);
     }
@@ -154,10 +175,17 @@ impl Peer {
         Self {
             caps,
             running: Arc::new(AtomicBool::new(false)),
+            live_workers: Arc::new(AtomicUsize::new(0)),
+            spawns: Arc::new(AtomicUsize::new(0)),
+            gen: AtomicU64::new(0),
             table: Mutex::new(RefTable {
                 entries: HashMap::new(),
             }),
         }
+    }
+
+    fn threads_started(&self) -> usize {
+        self.spawns.load(Ordering::Acquire)
     }
 
     fn try_begin(&self) -> bool {
@@ -170,44 +198,85 @@ impl Peer {
         self.running.store(false, Ordering::Release);
     }
 
+    /// Start the one worker. `work` owns the guard and drops it when the
+    /// action is finished. A `false` return starts nothing.
+    fn try_spawn<F>(&self, work: F) -> bool
+    where
+        F: FnOnce(WorkerGuard) + Send + 'static,
+    {
+        if !self.try_begin() {
+            log::error!("semantic a11y refused: one action is already running");
+            return false;
+        }
+        let live = self.live_workers.fetch_add(1, Ordering::AcqRel);
+        if live >= A11Y_WORKER_CAP {
+            self.live_workers.fetch_sub(1, Ordering::AcqRel);
+            self.end();
+            log::error!("semantic a11y refused: worker cap {A11Y_WORKER_CAP}");
+            return false;
+        }
+        let guard = WorkerGuard {
+            flag: Arc::clone(&self.running),
+            live: Arc::clone(&self.live_workers),
+        };
+        match thread::Builder::new()
+            .name("a11y-action".into())
+            .spawn(move || work(guard))
+        {
+            Ok(_) => {
+                self.spawns.fetch_add(1, Ordering::AcqRel);
+                true
+            }
+            Err(e) => {
+                log::error!("semantic a11y thread failed: {e}");
+                false
+            }
+        }
+    }
+
     fn snapshot_with<F>(&self, now: Instant, collect: F) -> Outcome
     where
         F: FnOnce() -> Result<Collected, &'static str> + Send + 'static,
     {
-        if !self.try_begin() {
-            log::error!("semantic snapshot refused: one snapshot is already running");
-            return Outcome::fail();
-        }
         let (tx, rx) = mpsc::channel();
-        let flag = Arc::clone(&self.running);
-        let spawned = thread::Builder::new()
-            .name("a11y-snapshot".into())
-            .spawn(move || {
-                let _clear = ClearOnDrop(flag);
-                let result = collect();
-                let _ = tx.send(result);
-            });
-        if let Err(e) = spawned {
-            self.end();
-            log::error!("semantic snapshot thread failed: {e}");
+        let (ack_tx, ack_rx) = mpsc::channel::<()>();
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        if !self.try_spawn(move |guard| {
+            let result = collect();
+            let _ = tx.send(result);
+            let _ = ack_rx.recv();
+            drop(guard);
+            let _ = done_tx.send(());
+        }) {
             return Outcome::fail();
         }
         let timeout = Duration::from_millis(self.caps.snapshot_timeout_ms);
         match rx.recv_timeout(timeout) {
-            Ok(Ok(collected)) => self.publish(collected, now),
-            Ok(Err(code)) => Outcome {
-                code,
-                detail: String::new(),
-            },
+            Ok(Ok(collected)) => {
+                let outcome = self.publish(collected, now);
+                let _ = ack_tx.send(());
+                let _ = done_rx.recv();
+                outcome
+            }
+            Ok(Err(code)) => {
+                let _ = ack_tx.send(());
+                let _ = done_rx.recv();
+                Outcome {
+                    code,
+                    detail: String::new(),
+                }
+            }
             Err(mpsc::RecvTimeoutError::Timeout) => {
                 log::error!(
                     "semantic snapshot exceeded {} ms",
                     self.caps.snapshot_timeout_ms
                 );
+                drop(ack_tx);
                 Outcome::fail()
             }
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 log::error!("semantic snapshot walk ended without a result");
+                drop(ack_tx);
                 Outcome::fail()
             }
         }
@@ -215,63 +284,99 @@ impl Peer {
 
     fn click_at<F>(&self, arg: &str, now: Instant, mut perform: F) -> &'static str
     where
-        F: FnMut(&Target) -> bool,
+        F: FnMut(&Target) -> &'static str,
     {
         let targets = match self.resolve(arg, now) {
             Ok(targets) => targets,
             Err(code) => return code,
         };
-        for target in &targets {
-            if !perform(target) {
-                log::error!("semantic click action failed");
-                return SNAPSHOT_FAILED;
-            }
+        if !self.try_begin() {
+            log::error!("semantic click refused: one action is already running");
+            return SNAPSHOT_FAILED;
         }
-        OK
+        let _guard = FlagGuard(Arc::clone(&self.running));
+        perform_all(&targets, &mut perform)
     }
 
     fn click_timed<F>(&self, arg: &str, now: Instant, mut perform: F) -> &'static str
     where
-        F: FnMut(&Target) -> bool + Send + 'static,
+        F: FnMut(&Target) -> &'static str + Send + 'static,
     {
         let targets = match self.resolve(arg, now) {
             Ok(targets) => targets,
             Err(code) => return code,
         };
-        let timeout = Duration::from_millis(self.caps.click_timeout_ms);
-        let cancel = Arc::new(AtomicBool::new(false));
-        let flag = Arc::clone(&cancel);
         let (tx, rx) = mpsc::channel();
-        let spawned = thread::Builder::new()
-            .name("a11y-click".into())
-            .spawn(move || {
-                let mut ok = true;
-                for target in &targets {
-                    if flag.load(Ordering::Acquire) || !perform(target) {
-                        ok = false;
-                        break;
-                    }
-                }
-                let _ = tx.send(ok);
-            });
-        if let Err(e) = spawned {
-            log::error!("semantic click thread failed: {e}");
+        if !self.try_spawn(move |guard| {
+            let code = perform_all(&targets, &mut perform);
+            drop(guard);
+            let _ = tx.send(code);
+        }) {
             return SNAPSHOT_FAILED;
         }
-        match rx.recv_timeout(timeout) {
-            Ok(true) => OK,
-            Ok(false) => {
-                log::error!("semantic click action failed");
-                SNAPSHOT_FAILED
-            }
+        match rx.recv_timeout(Duration::from_millis(self.caps.click_timeout_ms)) {
+            Ok(code) => code,
             Err(_) => {
-                cancel.store(true, Ordering::Release);
                 log::error!("semantic click exceeded {} ms", self.caps.click_timeout_ms);
                 SNAPSHOT_FAILED
             }
         }
     }
 
+    fn publish(&self, collected: Collected, now: Instant) -> Outcome {
+        let gen = self.gen.load(Ordering::Relaxed).saturating_add(1);
+        let built = match build_snapshot(&collected, &self.caps, gen) {
+            Ok(built) => built,
+            Err(()) => return Outcome::fail(),
+        };
+        let expires = match now.checked_add(Duration::from_millis(self.caps.ref_ttl_ms)) {
+            Some(expires) => expires,
+            None => {
+                log::error!("semantic snapshot ref expiry overflowed");
+                return Outcome::fail();
+            }
+        };
+        if !built.reason.is_empty() {
+            log::warn!(
+                "semantic snapshot truncated: {} refs, reason {}",
+                built.refs.len(),
+                built.reason
+            );
+        }
+        let mut table = self.table.lock().unwrap();
+        table.entries.clear();
+        for (r, target) in built.refs {
+            table.entries.insert(r, Entry { expires, target });
+        }
+        self.gen.store(gen, Ordering::Release);
+        Outcome {
+            code: OK,
+            detail: built.detail,
+        }
+    }
+}
+
+fn perform_all(
+    targets: &[Target],
+    perform: &mut impl FnMut(&Target) -> &'static str,
+) -> &'static str {
+    for target in targets {
+        let code = perform(target);
+        if code != OK {
+            if code != REF_STALE {
+                log::error!("semantic click action failed");
+            }
+            return if code == REF_STALE {
+                REF_STALE
+            } else {
+                SNAPSHOT_FAILED
+            };
+        }
+    }
+    OK
+}
+
+impl Peer {
     fn resolve(&self, arg: &str, now: Instant) -> Result<Vec<Target>, &'static str> {
         let refs = match parse_click_arg(arg, &self.caps) {
             Ok(refs) => refs,
@@ -293,36 +398,6 @@ impl Peer {
         }
         Ok(targets)
     }
-
-    fn publish(&self, collected: Collected, now: Instant) -> Outcome {
-        let built = match build_snapshot(&collected, &self.caps) {
-            Ok(built) => built,
-            Err(()) => return Outcome::fail(),
-        };
-        let expires = match now.checked_add(Duration::from_millis(self.caps.ref_ttl_ms)) {
-            Some(expires) => expires,
-            None => {
-                log::error!("semantic snapshot ref expiry overflowed");
-                return Outcome::fail();
-            }
-        };
-        if !built.reason.is_empty() {
-            log::warn!(
-                "semantic snapshot truncated: {} nodes, reason {}",
-                built.refs.len(),
-                built.reason
-            );
-        }
-        let mut table = self.table.lock().unwrap();
-        table.entries.clear();
-        for (r, target) in built.refs {
-            table.entries.insert(r, Entry { expires, target });
-        }
-        Outcome {
-            code: OK,
-            detail: built.detail,
-        }
-    }
 }
 
 struct Built {
@@ -331,7 +406,7 @@ struct Built {
     refs: Vec<(String, Target)>,
 }
 
-fn build_snapshot(collected: &Collected, caps: &Caps) -> Result<Built, ()> {
+fn build_snapshot(collected: &Collected, caps: &Caps, gen: u64) -> Result<Built, ()> {
     let reserve = envelope_len("payload");
     if reserve > caps.payload_max_bytes {
         log::error!(
@@ -345,21 +420,27 @@ fn build_snapshot(collected: &Collected, caps: &Caps) -> Result<Built, ()> {
     let mut used = reserve;
     let mut reason = "";
     let mut stopped = false;
+    let mut visited = 0usize;
     for node in &collected.nodes {
-        if parts.len() == caps.max_nodes {
+        if visited == caps.max_nodes {
             reason = "nodes";
             stopped = true;
             break;
         }
+        visited += 1;
         if node.path.len() > caps.max_nodes {
             log::error!("semantic snapshot path is {} indexes", node.path.len());
             return Err(());
         }
-        let r = format!("n{}", parts.len());
-        if r.len() > caps.ref_max_len {
-            log::error!("semantic snapshot ref {r} exceeds {}", caps.ref_max_len);
-            return Err(());
+        if !node.clickable {
+            continue;
         }
+        if refs.len() == caps.max_refs {
+            reason = "refs";
+            stopped = true;
+            break;
+        }
+        let r = format!("g{gen}.n{}", refs.len());
         let comma = usize::from(!parts.is_empty());
         let room = caps.payload_max_bytes - used - comma;
         let Some((json, shrunk)) = fit_node(node, &r, room) else {
@@ -564,7 +645,7 @@ fn parse_caps(text: &str) -> Result<Caps, String> {
         return Err(format!("caps json has {} fields", obj.len()));
     }
     Ok(Caps {
-        ref_max_len: field(obj, "ref_max_len")?,
+        max_refs: field(obj, "max_refs")?,
         max_nodes: field(obj, "max_nodes")?,
         payload_max_bytes: field(obj, "payload_max_bytes")?,
         snapshot_timeout_ms: field_u64(obj, "snapshot_timeout_ms")?,
@@ -590,9 +671,15 @@ fn field_u64(obj: &serde_json::Map<String, Value>, key: &str) -> Result<u64, Str
     Ok(n)
 }
 
+fn max_ref_token_len(max_refs: usize) -> usize {
+    let gen_digits = u64::MAX.to_string().len();
+    let index_digits = max_refs.saturating_sub(1).to_string().len().max(1);
+    "g".len() + gen_digits + ".n".len() + index_digits
+}
+
 fn click_arg_limit(caps: &Caps) -> usize {
     let n = caps.batch_max;
-    let per = 1 + caps.ref_max_len + 1;
+    let per = 1 + max_ref_token_len(caps.max_refs) + 1;
     let seps = n.saturating_sub(1) * 2;
     1 + n * per + seps + 1
 }
@@ -616,24 +703,46 @@ fn parse_click_arg(arg: &str, caps: &Caps) -> Result<Vec<String>, &'static str> 
         let mut refs = Vec::with_capacity(arr.len());
         for item in arr {
             let r = item.as_str().ok_or("ref is not a token")?;
-            if !ref_token_ok(r, caps.ref_max_len) {
+            if !ref_token_ok(r, caps.max_refs) {
                 return Err("ref is not a token");
             }
             refs.push(r.to_owned());
         }
         return Ok(refs);
     }
-    if !ref_token_ok(arg, caps.ref_max_len) {
+    if !ref_token_ok(arg, caps.max_refs) {
         return Err("ref is not a token");
     }
     Ok(vec![arg.to_owned()])
 }
 
-fn ref_token_ok(r: &str, max: usize) -> bool {
-    !r.is_empty()
-        && r.len() <= max
-        && r.bytes()
-            .all(|b| b.is_ascii_alphanumeric() || b == b'_' || b == b'-')
+fn ref_token_ok(r: &str, max_refs: usize) -> bool {
+    if r.len() > max_ref_token_len(max_refs) {
+        return false;
+    }
+    let Some(rest) = r.strip_prefix('g') else {
+        return false;
+    };
+    let Some((gen, index)) = rest.split_once(".n") else {
+        return false;
+    };
+    if gen.is_empty()
+        || index.is_empty()
+        || (gen.len() > 1 && gen.starts_with('0'))
+        || (index.len() > 1 && index.starts_with('0'))
+    {
+        return false;
+    }
+    if !gen.bytes().all(|b| b.is_ascii_digit()) || !index.bytes().all(|b| b.is_ascii_digit()) {
+        return false;
+    }
+    let Ok(gen) = gen.parse::<u64>() else {
+        return false;
+    };
+    let Ok(index) = index.parse::<usize>() else {
+        return false;
+    };
+    gen >= 1 && index < max_refs
 }
 
 fn parse_wire(raw: &str, caps: &Caps) -> Result<Collected, &'static str> {
@@ -669,6 +778,7 @@ fn parse_collected(json: &str, caps: &Caps) -> Result<Collected, &'static str> {
         (false, "") => "",
         (true, "nodes") => "nodes",
         (true, "payload") => "payload",
+        (true, "refs") => "refs",
         _ => return Err("truncated flag does not match reason"),
     };
     let nodes = obj.get("nodes").and_then(|v| v.as_array()).ok_or("nodes")?;
@@ -745,7 +855,7 @@ fn check_detail(detail: &str) -> Result<(), &'static str> {
         .ok_or("truncated")?;
     let reason = obj.get("reason").and_then(|v| v.as_str()).ok_or("reason")?;
     match (truncated, reason) {
-        (false, "") | (true, "nodes") | (true, "payload") => {}
+        (false, "") | (true, "nodes") | (true, "payload") | (true, "refs") => {}
         _ => return Err("truncated flag does not match reason"),
     }
     let nodes = obj.get("nodes").and_then(|v| v.as_array()).ok_or("nodes")?;
@@ -759,7 +869,7 @@ fn check_detail(detail: &str) -> Result<(), &'static str> {
             return Err("unexpected node fields");
         }
         let r = obj.get("ref").and_then(|v| v.as_str()).ok_or("ref")?;
-        if !ref_token_ok(r, caps.ref_max_len) {
+        if !ref_token_ok(r, caps.max_refs) {
             return Err("ref");
         }
         if seen.insert(r.to_owned(), ()).is_some() {
@@ -789,48 +899,78 @@ fn to_message(kind: &str, outcome: &Outcome) -> Message {
     }
 }
 
-struct SendSlot<F> {
-    inner: Mutex<Option<F>>,
-}
-
-impl<F> SendSlot<F>
-where
-    F: FnOnce(Message),
-{
-    fn deliver(&self, msg: Message) {
-        let send = self.inner.lock().unwrap().take();
-        if let Some(send) = send {
-            send(msg);
-        }
-    }
-}
-
 pub fn dispatch(kind: String, arg: String, send: impl FnOnce(Message) + Send + 'static) {
     if let Some(msg) = admit(&kind, &arg) {
         send(msg);
         return;
     }
-    let slot = Arc::new(SendSlot {
-        inner: Mutex::new(Some(send)),
-    });
-    let slot2 = Arc::clone(&slot);
-    let kind2 = kind.clone();
-    let name = if kind == SNAPSHOT {
-        "a11y-snapshot"
-    } else {
-        "a11y-click"
+    let Some(peer) = peer() else {
+        send(result_message(&kind, SNAPSHOT_FAILED));
+        return;
     };
-    let spawned = thread::Builder::new().name(name.into()).spawn(move || {
-        let msg = if kind == SNAPSHOT {
-            run_snapshot()
-        } else {
-            run_click(&arg)
-        };
-        slot2.deliver(msg);
+    let timeout = Duration::from_millis(if kind == SNAPSHOT {
+        peer.caps.snapshot_timeout_ms
+    } else {
+        peer.caps.click_timeout_ms
     });
-    if let Err(e) = spawned {
-        log::error!("semantic {kind2} thread failed: {e}");
-        slot.deliver(result_message(&kind2, SNAPSHOT_FAILED));
+    let (tx, rx) = hbb_common::tokio::sync::mpsc::channel(1);
+    let started = if kind == CLICK {
+        match peer.resolve(&arg, Instant::now()) {
+            Err(code) => {
+                send(result_message(CLICK, code));
+                return;
+            }
+            Ok(targets) => peer.try_spawn(move |guard| {
+                let code = perform_all(&targets, &mut perform_clicks);
+                drop(guard);
+                let _ = tx.blocking_send(result_message(CLICK, code));
+            }),
+        }
+    } else {
+        peer.try_spawn(move |guard| {
+            let outcome = match collect_tree() {
+                Ok(collected) => peer.publish(collected, Instant::now()),
+                Err(code) => Outcome {
+                    code,
+                    detail: String::new(),
+                },
+            };
+            drop(guard);
+            let _ = tx.blocking_send(to_message(SNAPSHOT, &outcome));
+        })
+    };
+    if !started {
+        send(result_message(&kind, SNAPSHOT_FAILED));
+        return;
+    }
+    arm_timeout(rx, timeout, kind, send);
+}
+
+fn arm_timeout(
+    mut rx: hbb_common::tokio::sync::mpsc::Receiver<Message>,
+    timeout: Duration,
+    kind: String,
+    send: impl FnOnce(Message) + Send + 'static,
+) {
+    let fail = result_message(&kind, SNAPSHOT_FAILED);
+    match hbb_common::tokio::runtime::Handle::try_current() {
+        Ok(handle) => {
+            handle.spawn(async move {
+                let msg = match hbb_common::tokio::time::timeout(timeout, rx.recv()).await {
+                    Ok(Some(msg)) => msg,
+                    _ => fail,
+                };
+                send(msg);
+            });
+        }
+        Err(_) => {
+            let started = Instant::now();
+            let msg = match rx.blocking_recv() {
+                Some(msg) if started.elapsed() <= timeout => msg,
+                _ => fail,
+            };
+            send(msg);
+        }
     }
 }
 
@@ -848,22 +988,6 @@ fn admit(kind: &str, arg: &str) -> Option<Message> {
         let _ = arg;
         None
     }
-}
-
-fn run_snapshot() -> Message {
-    let Some(peer) = peer() else {
-        return result_message(SNAPSHOT, SNAPSHOT_FAILED);
-    };
-    let outcome = peer.snapshot_with(Instant::now(), collect_tree);
-    to_message(SNAPSHOT, &outcome)
-}
-
-fn run_click(arg: &str) -> Message {
-    let Some(peer) = peer() else {
-        return result_message(CLICK, SNAPSHOT_FAILED);
-    };
-    let code = peer.click_timed(arg, Instant::now(), perform_clicks);
-    result_message(CLICK, code)
 }
 
 #[cfg(target_os = "android")]
@@ -890,7 +1014,15 @@ fn collect_tree() -> Result<Collected, &'static str> {
     Err(UNSUPPORTED)
 }
 
-fn perform_clicks(target: &Target) -> bool {
+fn click_bounds_code(stored: [i32; 4], live: [i32; 4]) -> &'static str {
+    if stored == live {
+        OK
+    } else {
+        REF_STALE
+    }
+}
+
+fn perform_clicks(target: &Target) -> &'static str {
     #[cfg(target_os = "android")]
     {
         return perform_click_android(target);
@@ -898,23 +1030,24 @@ fn perform_clicks(target: &Target) -> bool {
     #[cfg(not(target_os = "android"))]
     {
         let _ = target;
-        false
+        SNAPSHOT_FAILED
     }
 }
 
 #[cfg(target_os = "android")]
-fn perform_click_android(target: &Target) -> bool {
+fn perform_click_android(target: &Target) -> &'static str {
     let _guard = a11y_lock();
     let arg = encode_target(target);
     match scrap::android::call_main_service_semantic_action(CLICK, &arg) {
-        Ok(code) if code == OK => true,
+        Ok(code) if code == OK => OK,
+        Ok(code) if code == REF_STALE => REF_STALE,
         Ok(code) => {
             log::error!("semantic click -> {code}");
-            false
+            SNAPSHOT_FAILED
         }
         Err(e) => {
             log::error!("semantic click jni failed: {e}");
-            false
+            SNAPSHOT_FAILED
         }
     }
 }
@@ -975,7 +1108,8 @@ mod tests {
     #[test]
     fn caps_json_is_the_contract() {
         let caps = caps_ok();
-        assert_eq!(caps.ref_max_len, 80);
+        assert_eq!(caps.max_refs, 80);
+        assert_eq!(A11Y_WORKER_CAP, 1);
         assert_eq!(caps.max_nodes, 256);
         assert_eq!(caps.payload_max_bytes, 32 * 1024);
         assert_eq!(caps.snapshot_timeout_ms, 1_500);
@@ -1013,34 +1147,34 @@ mod tests {
         assert_eq!(parsed["reason"], "");
         let nodes = parsed["nodes"].as_array().unwrap();
         assert_eq!(nodes.len(), 2);
-        assert_eq!(nodes[0]["ref"], "n0");
+        assert_eq!(nodes[0]["ref"], "g1.n0");
         assert_eq!(nodes[0]["text"], "搜索");
         assert_eq!(nodes[0]["pkg"], "com.sankuai.meituan");
         assert_eq!(nodes[0]["click"], true);
-        assert_eq!(nodes[1]["ref"], "n1");
+        assert_eq!(nodes[1]["ref"], "g1.n1");
         assert!(outcome.detail.len() <= caps_ok().payload_max_bytes);
         accept_snapshot_detail(&outcome.detail).unwrap();
         let msg = result_message_with_detail(SNAPSHOT, OK, &outcome.detail);
         match msg.union {
             Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
                 assert_eq!(result.code, OK);
-                assert!(result.detail.contains("\"ref\":\"n0\""));
+                assert!(result.detail.contains("\"ref\":\"g1.n0\""));
             }
             other => panic!("expected SemanticActionResult, got {other:?}"),
         }
 
         let mut hit = Vec::new();
-        let code = peer.click_at("n0", now, |target| {
+        let code = peer.click_at("g1.n0", now, |target| {
             hit.push(target.bounds);
-            true
+            OK
         });
         assert_eq!(code, OK);
         assert_eq!(hit, vec![[0, 10, 20, 30]]);
 
         let mut batch = 0;
-        let code = peer.click_at("[\"n0\",\"n1\"]", now, |_| {
+        let code = peer.click_at("[\"g1.n0\",\"g1.n1\"]", now, |_| {
             batch += 1;
-            true
+            OK
         });
         assert_eq!(code, OK);
         assert_eq!(batch, 2);
@@ -1058,14 +1192,14 @@ mod tests {
             ]))
         });
         let live = now + Duration::from_millis(caps.ref_ttl_ms - 1);
-        assert_eq!(peer.click_at("n0", live, |_| true), OK);
+        assert_eq!(peer.click_at("g1.n0", live, |_| OK), OK);
         let expired = now + Duration::from_millis(caps.ref_ttl_ms);
         assert_eq!(
-            peer.click_at("n1", expired, |_| panic!("stale ref was clicked")),
+            peer.click_at("g1.n1", expired, |_| panic!("stale ref was clicked")),
             REF_STALE
         );
         assert_eq!(
-            peer.click_at("n9", now, |_| panic!("unknown ref was clicked")),
+            peer.click_at("g1.n9", now, |_| panic!("unknown ref was clicked")),
             REF_STALE
         );
 
@@ -1073,10 +1207,10 @@ mod tests {
             Ok(collect(vec![sample("只剩一个", vec![0u16], [9, 9, 9, 9])]))
         });
         assert_eq!(
-            peer.click_at("n1", now, |_| panic!("replaced ref was clicked")),
+            peer.click_at("g1.n1", now, |_| panic!("replaced ref was clicked")),
             REF_STALE
         );
-        assert_eq!(peer.click_at("n0", now, |_| true), OK);
+        assert_eq!(peer.click_at("g2.n0", now, |_| OK), OK);
     }
 
     #[test]
@@ -1086,17 +1220,17 @@ mod tests {
         let nodes: Vec<_> = (0..80)
             .map(|i| sample(&fat, vec![i as u16], [0, i, 1, i + 1]))
             .collect();
-        let built = build_snapshot(&collect(nodes), &caps).unwrap();
+        let built = build_snapshot(&collect(nodes), &caps, 1).unwrap();
         assert!(built.detail.len() <= caps.payload_max_bytes);
         let parsed: Value = serde_json::from_str(&built.detail).unwrap();
         assert_eq!(parsed["truncated"], true);
         assert_eq!(parsed["reason"], "payload");
         let n = parsed["nodes"].as_array().unwrap().len();
-        assert!(n > 0 && n < 80, "{n}");
+        assert!(n > 0 && n < caps.max_refs, "{n}");
         assert!(n < caps.max_nodes);
 
         let huge = sample(&"x".repeat(40_000), vec![0u16], [0, 0, 1, 1]);
-        let built = build_snapshot(&collect(vec![huge]), &caps).unwrap();
+        let built = build_snapshot(&collect(vec![huge]), &caps, 1).unwrap();
         assert!(built.detail.len() <= caps.payload_max_bytes);
         let parsed: Value = serde_json::from_str(&built.detail).unwrap();
         assert_eq!(parsed["reason"], "payload");
@@ -1108,7 +1242,7 @@ mod tests {
     #[test]
     fn node_cap_stops_at_the_limit() {
         let caps = caps_ok();
-        let nodes: Vec<_> = (0..300)
+        let mut nodes: Vec<_> = (0..300)
             .map(|i| RawNode {
                 class_name: "c".into(),
                 text: format!("t{i}"),
@@ -1120,17 +1254,35 @@ mod tests {
                 path: vec![i as u16],
             })
             .collect();
-        let built = build_snapshot(&collect(nodes), &caps).unwrap();
+        nodes[256].text = "past-cap".into();
+        nodes[256].clickable = true;
+        let built = build_snapshot(&collect(nodes), &caps, 1).unwrap();
         let parsed: Value = serde_json::from_str(&built.detail).unwrap();
         assert_eq!(parsed["truncated"], true);
         assert_eq!(parsed["reason"], "nodes");
-        let nodes = parsed["nodes"].as_array().unwrap();
-        assert_eq!(nodes.len(), caps.max_nodes);
-        assert_eq!(nodes[0]["text"], "t0");
-        assert!(built.detail.contains("\"text\":\"t255\""));
-        assert!(!built.detail.contains("\"text\":\"t256\""));
+        assert!(parsed["nodes"].as_array().unwrap().is_empty());
+        assert!(!built.detail.contains("past-cap"));
         assert!(built.detail.len() <= caps.payload_max_bytes);
-        assert_eq!(built.refs.len(), caps.max_nodes);
+        assert!(built.refs.is_empty());
+    }
+
+    #[test]
+    fn ref_count_stops_at_eighty_clickable_nodes() {
+        let caps = caps_ok();
+        let nodes: Vec<_> = (0..100)
+            .map(|i| sample(&format!("c{i}"), vec![i as u16], [0, i, 1, i + 1]))
+            .collect();
+        let built = build_snapshot(&collect(nodes), &caps, 7).unwrap();
+        let parsed: Value = serde_json::from_str(&built.detail).unwrap();
+        assert_eq!(parsed["truncated"], true);
+        assert_eq!(parsed["reason"], "refs");
+        let nodes = parsed["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), caps.max_refs);
+        assert_eq!(nodes[0]["ref"], "g7.n0");
+        assert_eq!(nodes[79]["ref"], "g7.n79");
+        assert_eq!(nodes[0]["click"], true);
+        assert!(!built.detail.contains("\"text\":\"c80\""));
+        assert_eq!(built.refs.len(), caps.max_refs);
     }
 
     #[test]
@@ -1169,7 +1321,7 @@ mod tests {
         let arg = format!(
             "[{}]",
             (0..9)
-                .map(|i| format!("\"n{i}\""))
+                .map(|i| format!("\"g1.n{i}\""))
                 .collect::<Vec<_>>()
                 .join(",")
         );
@@ -1181,7 +1333,7 @@ mod tests {
         let eight = format!(
             "[{}]",
             (0..8)
-                .map(|i| format!("\"n{i}\""))
+                .map(|i| format!("\"g1.n{i}\""))
                 .collect::<Vec<_>>()
                 .join(",")
         );
@@ -1189,12 +1341,12 @@ mod tests {
         assert_eq!(
             peer.click_at(&eight, now, |_| {
                 n += 1;
-                true
+                OK
             }),
             OK
         );
         assert_eq!(n, 8);
-        let long = "n".repeat(caps_ok().ref_max_len + 1);
+        let long = "g1.n".to_owned() + &"1".repeat(40);
         assert_eq!(
             peer.click_at(&long, now, |_| panic!("long ref clicked")),
             SNAPSHOT_FAILED
@@ -1224,7 +1376,7 @@ mod tests {
         let caps = caps_ok();
         let now = Instant::now();
         assert_eq!(
-            peer.snapshot_with(now, || Ok(collect(vec![sample(
+            peer.snapshot_with(now, move || Ok(collect(vec![sample(
                 "搜索",
                 vec![0u16],
                 [0, 0, 1, 1]
@@ -1234,9 +1386,9 @@ mod tests {
         );
         let started = Instant::now();
         let slow = caps.click_timeout_ms + 5_000;
-        let code = peer.click_timed("n0", now, move |_target| {
+        let code = peer.click_timed("g1.n0", now, move |_target| {
             thread::sleep(Duration::from_millis(slow));
-            true
+            OK
         });
         let elapsed = started.elapsed();
         assert_eq!(code, SNAPSHOT_FAILED);
@@ -1252,15 +1404,121 @@ mod tests {
             r#"{"truncated":false,"reason":"","nodes":[{"cls":"android.widget.Button","text":"搜索","desc":"","id":"com.sankuai.meituan:id/search","pkg":"com.sankuai.meituan","click":true,"b":[0,10,20,30],"path":[]}]}"#
         );
         let collected = parse_wire(wire, &caps).unwrap();
-        let built = build_snapshot(&collected, &caps).unwrap();
+        let built = build_snapshot(&collected, &caps, 1).unwrap();
         assert_eq!(
             built.detail,
-            r#"{"truncated":false,"reason":"","nodes":[{"ref":"n0","cls":"android.widget.Button","text":"搜索","desc":"","id":"com.sankuai.meituan:id/search","pkg":"com.sankuai.meituan","click":true,"b":[0,10,20,30]}]}"#
+            r#"{"truncated":false,"reason":"","nodes":[{"ref":"g1.n0","cls":"android.widget.Button","text":"搜索","desc":"","id":"com.sankuai.meituan:id/search","pkg":"com.sankuai.meituan","click":true,"b":[0,10,20,30]}]}"#
         );
         assert_eq!(
             encode_target(&built.refs[0].1),
             r#"{"path":[],"b":[0,10,20,30]}"#
         );
+    }
+
+    #[test]
+    fn a_stuck_click_rejects_the_next_click_without_a_thread() {
+        let peer = Arc::new(peer());
+        let now = Instant::now();
+        assert_eq!(
+            peer.snapshot_with(now, move || Ok(collect(vec![sample(
+                "搜索",
+                vec![0u16],
+                [0, 0, 10, 10]
+            )])))
+            .code,
+            OK
+        );
+        let before = peer.threads_started();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let first = Arc::clone(&peer);
+        let worker = thread::spawn(move || {
+            first.click_timed("g1.n0", now, move |_target| {
+                started_tx.send(()).unwrap();
+                let _ = release_rx.recv();
+                OK
+            })
+        });
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let started = peer.threads_started();
+        assert_eq!(started, before + 1);
+        assert!(peer.live_workers.load(Ordering::Acquire) <= A11Y_WORKER_CAP);
+        let code = peer.click_timed("g1.n0", now, |_| panic!("busy click started work"));
+        assert_eq!(code, SNAPSHOT_FAILED);
+        assert_eq!(peer.threads_started(), started);
+        release_tx.send(()).unwrap();
+        assert_eq!(worker.join().unwrap(), OK);
+    }
+
+    #[test]
+    fn moved_bounds_are_ref_stale_and_are_not_clicked() {
+        let peer = peer();
+        let now = Instant::now();
+        let bounds = [0, 0, 10, 10];
+        assert_eq!(
+            peer.snapshot_with(now, move || Ok(collect(vec![sample(
+                "搜索",
+                vec![0u16],
+                bounds
+            )])))
+            .code,
+            OK
+        );
+        assert_eq!(click_bounds_code(bounds, [0, 0, 10, 11]), REF_STALE);
+        let mut clicked = false;
+        let code = peer.click_at("g1.n0", now, |target| {
+            let live = [0, 0, 10, 11];
+            let verdict = click_bounds_code(target.bounds, live);
+            if verdict != OK {
+                return verdict;
+            }
+            clicked = true;
+            OK
+        });
+        assert_eq!(code, REF_STALE);
+        assert!(!clicked);
+    }
+
+    #[test]
+    fn an_old_generation_misses_a_same_sized_node() {
+        let peer = peer();
+        let now = Instant::now();
+        let bounds = [4, 8, 40, 48];
+        assert_eq!(
+            peer.snapshot_with(now, move || Ok(collect(vec![sample(
+                "搜索",
+                vec![0u16],
+                bounds
+            )])))
+            .code,
+            OK
+        );
+        assert_eq!(
+            peer.snapshot_with(now, move || Ok(collect(vec![sample(
+                "搜索",
+                vec![0u16],
+                bounds
+            )])))
+            .code,
+            OK
+        );
+        let mut clicked = false;
+        assert_eq!(
+            peer.click_at("g1.n0", now, |_| {
+                clicked = true;
+                OK
+            }),
+            REF_STALE
+        );
+        assert!(!clicked);
+        assert_eq!(
+            peer.click_at("g2.n0", now, |_| {
+                clicked = true;
+                OK
+            }),
+            OK
+        );
+        assert!(clicked);
     }
 
     #[test]
