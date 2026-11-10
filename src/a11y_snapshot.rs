@@ -36,7 +36,7 @@ use serde_json::Value;
 use std::{
     collections::HashMap,
     sync::{
-        atomic::{AtomicU64, AtomicUsize, Ordering},
+        atomic::{AtomicUsize, Ordering},
         mpsc, Arc, Mutex, OnceLock,
     },
     thread,
@@ -119,10 +119,7 @@ pub struct Peer {
     live_workers: Arc<AtomicUsize>,
     peak_workers: Arc<AtomicUsize>,
     spawns: Arc<AtomicUsize>,
-    gen: AtomicU64,
     table: Mutex<RefTable>,
-    #[cfg(test)]
-    publish_gap: Mutex<Option<Box<dyn Fn() + Send>>>,
 }
 
 enum Refuse {
@@ -135,6 +132,7 @@ struct Flight {
     holder: u64,
     since: Instant,
     abandoned: u64,
+    gen: u64,
 }
 
 struct Permit {
@@ -241,16 +239,14 @@ impl Peer {
                 holder: 0,
                 since: Instant::now(),
                 abandoned: 0,
+                gen: 0,
             })),
             live_workers: Arc::new(AtomicUsize::new(0)),
             peak_workers: Arc::new(AtomicUsize::new(0)),
             spawns: Arc::new(AtomicUsize::new(0)),
-            gen: AtomicU64::new(0),
             table: Mutex::new(RefTable {
                 entries: HashMap::new(),
             }),
-            #[cfg(test)]
-            publish_gap: Mutex::new(None),
         }
     }
 
@@ -423,39 +419,30 @@ impl Peer {
         }
     }
 
+    /// Token check, generation bump, and table replace share the flight lock.
+    /// The generation is not chosen before that lock is held.
     fn publish_if_current(
         &self,
         token: u64,
         collected: Collected,
         now: Instant,
     ) -> Option<Outcome> {
-        if !self.still_current(token) {
+        let mut flight = self.flight.lock().unwrap();
+        if flight.holder != token {
             return None;
         }
-        #[cfg(test)]
-        {
-            let hook = self.publish_gap.lock().unwrap().take();
-            if let Some(hook) = hook {
-                hook();
-            }
-        }
-        let gen = self.gen.load(Ordering::Relaxed).saturating_add(1);
+        let gen = flight.gen.saturating_add(1);
         let built = match build_snapshot(&collected, &self.caps, gen) {
             Ok(built) => built,
-            Err(()) => return self.fail_if_current(token),
+            Err(()) => return Some(Outcome::fail()),
         };
         let expires = match now.checked_add(Duration::from_millis(self.caps.ref_ttl_ms)) {
             Some(expires) => expires,
             None => {
                 log::error!("semantic snapshot ref expiry overflowed");
-                return self.fail_if_current(token);
+                return Some(Outcome::fail());
             }
         };
-        let flight = self.flight.lock().unwrap();
-        let mut table = self.table.lock().unwrap();
-        if flight.holder != token {
-            return None;
-        }
         if !built.reason.is_empty() {
             log::warn!(
                 "semantic snapshot truncated: {} refs, reason {}",
@@ -463,19 +450,16 @@ impl Peer {
                 built.reason
             );
         }
+        let mut table = self.table.lock().unwrap();
         table.entries.clear();
         for (r, target) in built.refs {
             table.entries.insert(r, Entry { expires, target });
         }
-        self.gen.store(gen, Ordering::Release);
+        flight.gen = gen;
         Some(Outcome {
             code: OK,
             detail: built.detail,
         })
-    }
-
-    fn fail_if_current(&self, token: u64) -> Option<Outcome> {
-        self.still_current(token).then(Outcome::fail)
     }
 }
 
@@ -1855,38 +1839,40 @@ mod tests {
     }
 
     #[test]
-    fn a_stale_token_cannot_overwrite_the_table_after_the_check() {
-        let peer = Arc::new(peer());
+    fn a_late_token_does_not_reuse_the_generation() {
+        let peer = peer();
         let now = Instant::now();
         {
             let mut flight = peer.flight.lock().unwrap();
-            flight.holder = 7;
+            flight.holder = 2;
         }
-        let hooked = Arc::clone(&peer);
-        *peer.publish_gap.lock().unwrap() = Some(Box::new(move || {
-            let mut flight = hooked.flight.lock().unwrap();
-            flight.holder = 8;
-            drop(flight);
-            let mut table = hooked.table.lock().unwrap();
-            table.entries.clear();
-            table.entries.insert(
-                "kept".into(),
-                Entry {
-                    expires: now + Duration::from_secs(5),
-                    target: Target {
-                        path: vec![1],
-                        bounds: [4, 4, 4, 4],
-                    },
-                },
-            );
-        }));
+        let fresh = peer
+            .publish_if_current(
+                2,
+                collect(vec![sample("NEW", vec![0], [9, 9, 19, 19])]),
+                now,
+            )
+            .unwrap();
+        assert!(fresh.detail.contains("\"ref\":\"g1.n0\""));
+        assert_eq!(peer.flight.lock().unwrap().gen, 1);
         let late =
-            peer.publish_if_current(7, collect(vec![sample("LATE", vec![0], [1, 1, 2, 2])]), now);
+            peer.publish_if_current(1, collect(vec![sample("LATE", vec![0], [1, 1, 2, 2])]), now);
         assert!(late.is_none());
+        assert_eq!(peer.flight.lock().unwrap().gen, 1);
+        {
+            let table = peer.table.lock().unwrap();
+            assert_eq!(table.entries.len(), 1);
+            assert_eq!(table.entries["g1.n0"].target.bounds, [9, 9, 19, 19]);
+        }
+        let next = peer
+            .publish_if_current(2, collect(vec![sample("NEXT", vec![0], [3, 3, 4, 4])]), now)
+            .unwrap();
+        assert!(next.detail.contains("\"ref\":\"g2.n0\""));
+        assert!(!next.detail.contains("LATE"));
+        assert_eq!(peer.flight.lock().unwrap().gen, 2);
         let table = peer.table.lock().unwrap();
-        assert!(table.entries.contains_key("kept"));
-        assert_eq!(table.entries.len(), 1);
-        assert_eq!(table.entries["kept"].target.bounds, [4, 4, 4, 4]);
+        assert_eq!(table.entries["g2.n0"].target.bounds, [3, 3, 4, 4]);
+        assert!(!table.entries.contains_key("g1.n0"));
     }
 
     #[test]
