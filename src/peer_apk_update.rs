@@ -1,8 +1,8 @@
 //! Check and cover-install the Android peer APK from this fork's GitHub Releases.
 //!
 //! Discovery is `https://github.com/1304257658/mobile-cu-bridge` only. The sha256
-//! comes from the release `SHA256SUMS` file, checked against the asset digest
-//! when GitHub sends one. `api.rustdesk.com` and `github.com/rustdesk/rustdesk`
+//! used to skip a cover-install comes from the release `SHA256SUMS` file, not
+//! from asset digest metadata. `api.rustdesk.com` and `github.com/rustdesk/rustdesk`
 //! are refused.
 //!
 //! Cover-install does not uninstall. The OS kills this process when the
@@ -913,14 +913,7 @@ fn lock_sha(choice: &ReleaseChoice, sums_text: Option<&str>) -> Result<Admitted,
                     return Err(UPDATE_CHECKSUM);
                 }
                 match sha_from_sums(text, &choice.name)? {
-                    Some(from_sums) => {
-                        if let Some(digest) = &choice.digest_sha {
-                            if !digest.eq_ignore_ascii_case(&from_sums) {
-                                return Err(UPDATE_CHECKSUM);
-                            }
-                        }
-                        Some(from_sums)
-                    }
+                    Some(from_sums) => Some(from_sums),
                     None => {
                         log::info!(
                             "peer apk SHA256SUMS has no entry for {}; continue cover-install",
@@ -1851,10 +1844,18 @@ mod tests {
         assert!(!admitted.url.contains("api.rustdesk.com"));
         assert_eq!(admitted.sha256, DEVICE_SHA);
         assert_eq!(admitted.sums_sha.as_deref(), Some(DEVICE_SHA));
+        let sums_not_digest = lock_sha(
+            &choice,
+            Some(
+                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n",
+            ),
+        )
+        .unwrap();
         assert_eq!(
-            lock_sha(&choice, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n")),
-            Err(UPDATE_CHECKSUM)
+            sums_not_digest.sums_sha.as_deref(),
+            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
         );
+        assert_ne!(sums_not_digest.sha256, DEVICE_SHA);
         assert_eq!(
             choose_release(list.as_bytes(), "x86_64", None, None),
             Err(semantic_action::UNSUPPORTED)
@@ -1942,7 +1943,7 @@ mod tests {
     #[test]
     fn same_sha_skips_cover_install() {
         let sums = sums_line(DEVICE_SHA);
-        let from_sums = lock_sha(&release_choice(Some(DEVICE_SHA), true), Some(&sums)).unwrap();
+        let from_sums = lock_sha(&release_choice(None, true), Some(&sums)).unwrap();
         assert_eq!(from_sums.sums_sha.as_deref(), Some(DEVICE_SHA));
         assert!(!from_sums.url.contains("rustdesk/rustdesk"));
         assert!(!from_sums.url.contains("api.rustdesk.com"));
@@ -1968,6 +1969,18 @@ mod tests {
         assert!(skip_same_sums(
             Ok(&DEVICE_SHA.to_ascii_uppercase()),
             Some(&DEVICE_SHA.to_ascii_lowercase()),
+        ));
+        let digest_disagrees =
+            lock_sha(&release_choice(Some(SHA_RUSTDESK), true), Some(&sums)).unwrap();
+        assert_eq!(digest_disagrees.sums_sha.as_deref(), Some(DEVICE_SHA));
+        assert_eq!(digest_disagrees.sha256, DEVICE_SHA);
+        assert!(skip_same_sums(
+            Ok(DEVICE_SHA),
+            digest_disagrees.sums_sha.as_deref(),
+        ));
+        assert!(!skip_same_sums(
+            Ok(SHA_RUSTDESK),
+            digest_disagrees.sums_sha.as_deref(),
         ));
 
         let mut installs = 0u32;

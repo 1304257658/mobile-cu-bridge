@@ -1064,4 +1064,35 @@ mod tests {
         assert_eq!(flight.result(), OK);
         assert!(flight.detail().is_empty());
     }
+
+    #[test]
+    fn check_update_detail_reaches_the_controller() {
+        let sent = result_message_with_detail(CHECK_UPDATE, OK, CHECK_UPDATE_ALREADY_LATEST);
+        let result = match sent.union {
+            Some(base::message_proto::message::Union::SemanticActionResult(result)) => result,
+            other => panic!("expected SemanticActionResult, got {other:?}"),
+        };
+        let mut flight = Flight::default();
+        store_peer_result(&mut flight, &result.kind, &result.code, &result.detail);
+        assert_eq!(flight.result(), OK);
+        assert_eq!(flight.detail(), CHECK_UPDATE_ALREADY_LATEST);
+        assert!(is_peer_success(flight.result()));
+        assert!(!is_peer_success(flight.detail()));
+        assert!(!is_peer_success(CHECK_UPDATE_ALREADY_LATEST));
+        assert!(!is_peer_success(""));
+        for code in [
+            UPDATE_NETWORK,
+            UPDATE_CHECKSUM,
+            UPDATE_SIGNATURE,
+            UPDATE_INSTALL,
+            UPDATE_ID_CHANGED,
+            NO_SESSION,
+            UNSUPPORTED,
+            INJECT_FAILED,
+        ] {
+            assert!(!is_peer_success(code), "{code}");
+        }
+        assert!(is_peer_success(OK));
+        assert_eq!(is_peer_success(OK), flight.result() == OK);
+    }
 }
