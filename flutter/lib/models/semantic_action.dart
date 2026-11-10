@@ -57,10 +57,15 @@ const String semanticUpdateSignature = 'signature';
 const String semanticUpdateInstall = 'install';
 const String semanticUpdateIdChanged = 'id_changed';
 
+/// Detail on a `check_update` [semanticOk] when cover-install was skipped.
+/// Not a result code. Read it from `sessionSemanticDetail`.
+const String semanticUpdateAlreadyLatest = 'already_latest';
+
 /// True only when [peerResult] is the peer completion `ok`.
 ///
 /// Do not pass the return value of `sessionSemanticAction`. That `ok` means
-/// the message was queued.
+/// the message was queued. [semanticUpdateAlreadyLatest] is a detail, not success
+/// by itself.
 bool semanticPeerSuccess(String peerResult) => peerResult == semanticOk;
 
 /// Empty or missing completion is a readable failure, not success.

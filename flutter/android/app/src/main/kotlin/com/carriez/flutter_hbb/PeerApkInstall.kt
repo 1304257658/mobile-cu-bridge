@@ -19,6 +19,29 @@ import java.util.concurrent.atomic.AtomicReference
 private const val PEER_APK_LOG = "PeerApkInstall"
 private const val PEER_APK_ACTION = "com.carriez.flutter_hbb.PEER_APK_UPDATE"
 
+internal fun peerApkInstalledWire(context: Context): String {
+    return try {
+        val path = context.applicationInfo.sourceDir ?: return "no_source"
+        val file = File(path)
+        installedApkWire(
+            path,
+            installedVersionCode(context),
+            file.isFile,
+            symlink(file),
+            file.length(),
+        )
+    } catch (e: Exception) {
+        Log.e(PEER_APK_LOG, "peer apk installed identity failed", e)
+        "no_source"
+    }
+}
+
+@Suppress("DEPRECATION")
+private fun installedVersionCode(context: Context): Long {
+    val info = context.packageManager.getPackageInfo(context.packageName, 0)
+    return if (Build.VERSION.SDK_INT >= 28) info.longVersionCode else info.versionCode.toLong()
+}
+
 internal fun peerApkCertWire(context: Context, apkPath: String): String {
     val file = File(apkPath)
     apkFileCode(file.name, file.length(), symlink(file), file.isFile)?.let { return it }

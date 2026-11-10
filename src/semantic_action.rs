@@ -14,8 +14,10 @@
 //!
 //! `check_update` downloads the Android peer APK from a GitHub Release,
 //! checks sha256, and cover-installs it only when the signing cert matches.
-//! It does not uninstall. `network`, `checksum`, `signature`, `install`, and
-//! `id_changed` are peer failures, not `inject_failed`.
+//! It does not uninstall. When the installed APK sha256 matches `SHA256SUMS`,
+//! the result code stays `ok` and the detail is `already_latest`.
+//! `network`, `checksum`, `signature`, `install`, and `id_changed` are peer
+//! failures, not `inject_failed`.
 
 use base::message_proto::{Message, SemanticAction, SemanticActionResult};
 use hbb_common::{log, protobuf::Message as _};
@@ -37,6 +39,10 @@ pub const UPDATE_CHECKSUM: &str = "checksum";
 pub const UPDATE_SIGNATURE: &str = "signature";
 pub const UPDATE_INSTALL: &str = "install";
 pub const UPDATE_ID_CHANGED: &str = "id_changed";
+
+/// Detail on a `check_update` [`OK`] when the installed APK matches
+/// `SHA256SUMS` and cover-install was skipped. Not a result code.
+pub const CHECK_UPDATE_ALREADY_LATEST: &str = "already_latest";
 
 pub const KINDS: [&str; 8] = [
     SYS_BACK,
@@ -62,7 +68,8 @@ pub const LIST_APPS_BLOCKING_TIMEOUT_MS: u64 = 5_000;
 /// Enqueue acknowledgement from `session_semantic_action`, and the peer
 /// completion code from `session_semantic_result`. The enqueue value is not
 /// peer success. Success is only this string when `session_semantic_result`
-/// returns it.
+/// returns it. A skipped `check_update` is still this code; its detail is
+/// [`CHECK_UPDATE_ALREADY_LATEST`].
 pub const OK: &str = "ok";
 pub const NO_SESSION: &str = "no_session";
 pub const UNSUPPORTED: &str = "unsupported";
@@ -189,7 +196,9 @@ pub fn result_message(kind: &str, code: &str) -> Message {
 
 /// Like [`result_message`], plus a `list_apps` detail payload.
 ///
-/// Any other kind drops the detail. `open_app` failure codes are unchanged.
+/// `check_update` keeps [`CHECK_UPDATE_ALREADY_LATEST`] on `ok` and drops any
+/// other detail. Every other kind drops the detail. `open_app` failure codes
+/// are unchanged.
 pub fn result_message_with_detail(kind: &str, code: &str, detail: &str) -> Message {
     let normalized = normalize_peer_code(code);
     let (code, detail) = if kind == LIST_APPS && normalized == OK {
@@ -200,6 +209,8 @@ pub fn result_message_with_detail(kind: &str, code: &str, detail: &str) -> Messa
                 (INJECT_FAILED, String::new())
             }
         }
+    } else if kind == CHECK_UPDATE {
+        (normalized, check_update_detail(normalized, detail))
     } else {
         (normalized, String::new())
     };
@@ -229,6 +240,7 @@ pub fn require_peer_result(stored: &str) -> &str {
 ///
 /// [`OK`] from `session_semantic_action` is the enqueue acknowledgement.
 /// Pass the value from `session_semantic_result`, not the enqueue return.
+/// `already_latest` is a `check_update` detail, not a success code.
 pub fn is_peer_success(result: &str) -> bool {
     result == OK
 }
@@ -284,18 +296,37 @@ impl Flight {
         require_peer_result(&self.code)
     }
 
-    /// `list_apps` JSON, or empty when this result has no payload.
+    /// `list_apps` JSON, `check_update` `already_latest`, or empty.
     pub fn detail(&self) -> &str {
         &self.detail
     }
+
+    fn finish_check_update(&mut self, code: &str, detail: &str) {
+        self.finish(code);
+        let kept = check_update_detail(&self.code, detail);
+        if !kept.is_empty() {
+            self.detail = kept;
+        }
+    }
 }
 
-/// Record a peer completion. `list_apps` keeps its detail. Every other kind
-/// stores only the code, so an `open_app` failure cannot be rewritten by a
-/// payload and is not collapsed into [`INJECT_FAILED`].
+fn check_update_detail(code: &str, detail: &str) -> String {
+    if code == OK && detail == CHECK_UPDATE_ALREADY_LATEST {
+        detail.to_owned()
+    } else {
+        String::new()
+    }
+}
+
+/// Record a peer completion. `list_apps` keeps its detail. `check_update`
+/// keeps only [`CHECK_UPDATE_ALREADY_LATEST`] on `ok`. Every other kind stores
+/// only the code, so an `open_app` failure cannot be rewritten by a payload
+/// and is not collapsed into [`INJECT_FAILED`].
 pub fn store_peer_result(flight: &mut Flight, kind: &str, code: &str, detail: &str) {
     if kind == LIST_APPS {
         flight.finish_list(code, detail);
+    } else if kind == CHECK_UPDATE {
+        flight.finish_check_update(code, detail);
     } else {
         flight.finish(code);
     }
@@ -1001,5 +1032,67 @@ mod tests {
         assert_eq!(flight.result(), UPDATE_ID_CHANGED);
         assert!(flight.detail().is_empty());
         assert!(!is_peer_success(flight.result()));
+
+        assert_eq!(CHECK_UPDATE_ALREADY_LATEST, "already_latest");
+        assert_eq!(
+            normalize_peer_code(CHECK_UPDATE_ALREADY_LATEST),
+            INJECT_FAILED
+        );
+        assert!(!is_peer_success(CHECK_UPDATE_ALREADY_LATEST));
+        let reply = result_message_with_detail(CHECK_UPDATE, OK, CHECK_UPDATE_ALREADY_LATEST);
+        match reply.union {
+            Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
+                assert_eq!(result.kind, CHECK_UPDATE);
+                assert_eq!(result.code, OK);
+                assert_eq!(result.detail, CHECK_UPDATE_ALREADY_LATEST);
+            }
+            other => panic!("expected SemanticActionResult, got {other:?}"),
+        }
+        let dropped = result_message_with_detail(CHECK_UPDATE, OK, "other");
+        match dropped.union {
+            Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
+                assert_eq!(result.code, OK);
+                assert!(result.detail.is_empty());
+            }
+            other => panic!("expected SemanticActionResult, got {other:?}"),
+        }
+        store_peer_result(&mut flight, CHECK_UPDATE, OK, CHECK_UPDATE_ALREADY_LATEST);
+        assert_eq!(flight.result(), OK);
+        assert_eq!(flight.detail(), CHECK_UPDATE_ALREADY_LATEST);
+        assert!(is_peer_success(flight.result()));
+        store_peer_result(&mut flight, CHECK_UPDATE, OK, "ignored");
+        assert_eq!(flight.result(), OK);
+        assert!(flight.detail().is_empty());
+    }
+
+    #[test]
+    fn check_update_detail_reaches_the_controller() {
+        let sent = result_message_with_detail(CHECK_UPDATE, OK, CHECK_UPDATE_ALREADY_LATEST);
+        let result = match sent.union {
+            Some(base::message_proto::message::Union::SemanticActionResult(result)) => result,
+            other => panic!("expected SemanticActionResult, got {other:?}"),
+        };
+        let mut flight = Flight::default();
+        store_peer_result(&mut flight, &result.kind, &result.code, &result.detail);
+        assert_eq!(flight.result(), OK);
+        assert_eq!(flight.detail(), CHECK_UPDATE_ALREADY_LATEST);
+        assert!(is_peer_success(flight.result()));
+        assert!(!is_peer_success(flight.detail()));
+        assert!(!is_peer_success(CHECK_UPDATE_ALREADY_LATEST));
+        assert!(!is_peer_success(""));
+        for code in [
+            UPDATE_NETWORK,
+            UPDATE_CHECKSUM,
+            UPDATE_SIGNATURE,
+            UPDATE_INSTALL,
+            UPDATE_ID_CHANGED,
+            NO_SESSION,
+            UNSUPPORTED,
+            INJECT_FAILED,
+        ] {
+            assert!(!is_peer_success(code), "{code}");
+        }
+        assert!(is_peer_success(OK));
+        assert_eq!(is_peer_success(OK), flight.result() == OK);
     }
 }

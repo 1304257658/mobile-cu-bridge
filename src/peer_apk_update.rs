@@ -1,14 +1,21 @@
 //! Check and cover-install the Android peer APK from this fork's GitHub Releases.
 //!
 //! Discovery is `https://github.com/1304257658/mobile-cu-bridge` only. The sha256
-//! comes from the release `SHA256SUMS` file, checked against the asset digest
-//! when GitHub sends one. `api.rustdesk.com` and `github.com/rustdesk/rustdesk`
+//! used to skip a cover-install comes from the release `SHA256SUMS` file, not
+//! from asset digest metadata. `api.rustdesk.com` and `github.com/rustdesk/rustdesk`
 //! are refused.
 //!
 //! Cover-install does not uninstall. The OS kills this process when the
 //! package is replaced, so the in-process path never reports `ok`. The id and
 //! `enc_id` are written to disk first. The next process compares that snapshot
 //! and the controller hears `ok` or `id_changed` when it reconnects.
+//!
+//! When the installed APK sha256 equals the `SHA256SUMS` entry for that file,
+//! the peer returns `ok` with detail `already_latest` and does not download or
+//! cover-install. That entry is only the skip decision. Install verification
+//! is the same as before: a declared `SHA256SUMS` that cannot be fetched is
+//! `network`, and a missing entry or a digest mismatch is `checksum`.
+//! The local digest is cached by path, mtime, length, and versionCode.
 
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
@@ -17,14 +24,14 @@ use crate::{
     semantic_action::{
         self, UPDATE_CHECKSUM, UPDATE_ID_CHANGED, UPDATE_INSTALL, UPDATE_NETWORK, UPDATE_SIGNATURE,
     },
-    update_hash::verify_sha256_reader,
+    update_hash::{sha256_reader_hex, verify_sha256_reader},
 };
 use hbb_common::log;
 use std::{
     fs::File,
     io::{self, Read, Seek, SeekFrom, Write},
     path::{Component, Path, PathBuf},
-    time::{Duration, Instant},
+    time::{Duration, Instant, UNIX_EPOCH},
 };
 
 const APK_MAX_BYTES: u64 = 96 * 1024 * 1024;
@@ -50,6 +57,8 @@ pub(crate) const BLOCKING_TIMEOUT_MS: u64 = 210_000;
 const APK_FILE_NAME: &str = "rustdesk-peer-update.apk";
 const SNAPSHOT_FILE: &str = "peer-update-id-snapshot";
 const VERDICT_FILE: &str = "peer-update-id-verdict";
+const SHA_CACHE_FILE: &str = "peer-update-apk-sha";
+const SHA_CACHE_MAX: u64 = 8 * 1024;
 const FORK_OWNER: &str = "1304257658";
 const FORK_REPO: &str = "mobile-cu-bridge";
 const RELEASES_API: &str =
@@ -59,11 +68,31 @@ const RELEASES_API: &str =
 /// The process is expected to die. `ok` / `id_changed` are reported after restart.
 pub(crate) const COMMITTED: &str = "committed";
 
+pub(crate) struct CheckUpdateReply {
+    pub code: &'static str,
+    pub detail: &'static str,
+}
+
+impl CheckUpdateReply {
+    fn bare(code: &'static str) -> Self {
+        Self { code, detail: "" }
+    }
+
+    fn skipped() -> Self {
+        Self {
+            code: semantic_action::OK,
+            detail: semantic_action::CHECK_UPDATE_ALREADY_LATEST,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct Admitted {
     url: String,
     size: u64,
     sha256: String,
+    /// Set only when `SHA256SUMS` names this file. Absent means do not skip.
+    sums_sha: Option<String>,
 }
 
 #[derive(Debug)]
@@ -83,28 +112,28 @@ impl IdMaterial {
     }
 }
 
-pub(crate) async fn run_with_deadline(arg: String) -> &'static str {
+pub(crate) async fn run_with_deadline(arg: String) -> CheckUpdateReply {
     match hbb_common::timeout(
         BLOCKING_TIMEOUT_MS,
         hbb_common::tokio::task::spawn_blocking(move || execute(&arg)),
     )
     .await
     {
-        Ok(Ok(code)) => code,
+        Ok(Ok(reply)) => reply,
         Ok(Err(e)) => {
             log::error!("peer apk update task failed: {e}");
-            UPDATE_INSTALL
+            CheckUpdateReply::bare(UPDATE_INSTALL)
         }
         Err(_) => {
             log::error!("peer apk update exceeded {BLOCKING_TIMEOUT_MS} ms");
-            UPDATE_NETWORK
+            CheckUpdateReply::bare(UPDATE_NETWORK)
         }
     }
 }
 
-pub(crate) fn execute(arg: &str) -> &'static str {
+pub(crate) fn execute(arg: &str) -> CheckUpdateReply {
     if semantic_action::validate(semantic_action::CHECK_UPDATE, arg) != semantic_action::OK {
-        return semantic_action::UNSUPPORTED;
+        return CheckUpdateReply::bare(semantic_action::UNSUPPORTED);
     }
     #[cfg(target_os = "android")]
     {
@@ -113,26 +142,33 @@ pub(crate) fn execute(arg: &str) -> &'static str {
     #[cfg(not(target_os = "android"))]
     {
         let _ = arg;
-        semantic_action::UNSUPPORTED
+        CheckUpdateReply::bare(semantic_action::UNSUPPORTED)
     }
 }
 
 #[cfg(target_os = "android")]
-fn execute_android(arg: &str) -> &'static str {
+fn execute_android(arg: &str) -> CheckUpdateReply {
     let deadline = Instant::now() + INNER_BUDGET;
     let Some(dir) = config_dir() else {
-        return UPDATE_INSTALL;
+        return CheckUpdateReply::bare(UPDATE_INSTALL);
     };
     if let Some(code) = take_verdict(&dir) {
-        return code;
+        return CheckUpdateReply::bare(code);
     }
     let artifact = match discover(arg, deadline) {
         Ok(artifact) => artifact,
-        Err(code) => return code,
+        Err(code) => return CheckUpdateReply::bare(code),
     };
+    if skip_same_sums(
+        local_installed_sha(&dir).as_deref(),
+        artifact.sums_sha.as_deref(),
+    ) {
+        log::info!("peer apk already_latest; skip download and cover-install");
+        return CheckUpdateReply::skipped();
+    }
     let before = match snapshot_id() {
         Ok(id) => id,
-        Err(code) => return code,
+        Err(code) => return CheckUpdateReply::bare(code),
     };
     let dest = apk_dest();
     let downloaded = download_apk(
@@ -167,7 +203,7 @@ fn execute_android(arg: &str) -> &'static str {
     if code != semantic_action::OK && code != COMMITTED {
         log::error!("peer apk check_update -> {code}");
     }
-    code
+    CheckUpdateReply::bare(code)
 }
 
 #[cfg(target_os = "android")]
@@ -379,6 +415,246 @@ fn android_update_arch() -> &'static str {
 
 fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
+}
+
+/// True only when `sums_sha` came from `SHA256SUMS` and matches the installed file.
+fn skip_same_sums(local: Result<&str, &'static str>, sums_sha: Option<&str>) -> bool {
+    let Some(release_sha) = sums_sha else {
+        return false;
+    };
+    match local {
+        Ok(local) if same_apk_sha(local, release_sha) => true,
+        Ok(local) if sha256_hex(local) && sha256_hex(release_sha) => {
+            log::info!("peer apk sha differs from SHA256SUMS; cover-install");
+            false
+        }
+        Ok(_) => {
+            log::info!("peer apk local sha unavailable (bad_sha); continue cover-install");
+            false
+        }
+        Err(reason) => {
+            log::info!("peer apk local sha unavailable ({reason}); continue cover-install");
+            false
+        }
+    }
+}
+
+fn same_apk_sha(local: &str, release: &str) -> bool {
+    sha256_hex(local) && sha256_hex(release) && local.eq_ignore_ascii_case(release)
+}
+
+#[cfg(target_os = "android")]
+fn local_installed_sha(dir: &Path) -> Result<String, &'static str> {
+    cached_apk_sha(dir, &installed_identity()?)
+}
+
+#[cfg(target_os = "android")]
+fn installed_identity() -> Result<InstalledApk, &'static str> {
+    let wire = match scrap::android::call_main_service_peer_apk_installed() {
+        Ok(wire) => wire,
+        Err(e) => {
+            log::info!("peer apk installed identity jni: {e}");
+            return Err("jni");
+        }
+    };
+    parse_installed_wire(&wire)
+}
+
+struct InstalledApk {
+    path: PathBuf,
+    version_code: u64,
+}
+
+struct ApkStamp {
+    path: String,
+    mtime_secs: u64,
+    mtime_nanos: u32,
+    version_code: u64,
+    len: u64,
+}
+
+fn parse_installed_wire(raw: &str) -> Result<InstalledApk, &'static str> {
+    let mut lines = raw.split('\n');
+    let head = lines.next().unwrap_or("").trim();
+    if head != "ok" {
+        return Err(known_identity_reason(head));
+    }
+    let path = lines.next().unwrap_or("");
+    let version = lines.next().unwrap_or("").trim();
+    if lines.next().is_some() {
+        return Err("bad_wire");
+    }
+    if !installed_path_ok(path) {
+        return Err("no_source");
+    }
+    if version.is_empty()
+        || version.len() > 20
+        || !version.bytes().all(|b| b.is_ascii_digit())
+        || (version.len() > 1 && version.as_bytes()[0] == b'0')
+    {
+        return Err("bad_version");
+    }
+    let version_code = version.parse().map_err(|_| "bad_version")?;
+    Ok(InstalledApk {
+        path: PathBuf::from(path),
+        version_code,
+    })
+}
+
+fn known_identity_reason(token: &str) -> &'static str {
+    match token {
+        "not_file" => "not_file",
+        "bad_size" => "bad_size",
+        "bad_version" => "bad_version",
+        "no_source" => "no_source",
+        "jni" => "jni",
+        "no_mtime" => "no_mtime",
+        "read_apk" => "read_apk",
+        "not_android" => "not_android",
+        _ => {
+            if token.len() <= 64
+                && token
+                    .bytes()
+                    .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+            {
+                log::info!("peer apk installed identity rejected ({token})");
+            } else {
+                log::info!("peer apk installed identity rejected");
+            }
+            "no_source"
+        }
+    }
+}
+
+fn installed_path_ok(path: &str) -> bool {
+    if path.is_empty() || path.len() > 4096 || !path.ends_with(".apk") {
+        return false;
+    }
+    if path.chars().any(|c| c == '\n' || c == '\r' || c == '\0') {
+        return false;
+    }
+    let parsed = Path::new(path);
+    if !parsed.is_absolute() {
+        return false;
+    }
+    parsed.components().all(|component| {
+        matches!(
+            component,
+            Component::RootDir | Component::Normal(_) | Component::Prefix(_)
+        )
+    })
+}
+
+fn cached_apk_sha(dir: &Path, installed: &InstalledApk) -> Result<String, &'static str> {
+    let stamp = file_stamp(&installed.path, installed.version_code)?;
+    if let Some(sha) = read_sha_cache(dir, &stamp) {
+        return Ok(sha);
+    }
+    let sha = hash_regular_apk(&installed.path, stamp.len)?;
+    if let Err(code) = write_sha_cache(dir, &stamp, &sha) {
+        log::info!("peer apk sha cache write failed ({code})");
+    }
+    Ok(sha)
+}
+
+fn file_stamp(path: &Path, version_code: u64) -> Result<ApkStamp, &'static str> {
+    let path_str = path.to_str().ok_or("no_source")?;
+    if !installed_path_ok(path_str) {
+        return Err("no_source");
+    }
+    let meta = std::fs::symlink_metadata(path).map_err(|_| "no_source")?;
+    if !meta.file_type().is_file() {
+        return Err("not_file");
+    }
+    let len = meta.len();
+    if len == 0 || len > APK_MAX_BYTES {
+        return Err("bad_size");
+    }
+    let modified = meta.modified().map_err(|_| "no_mtime")?;
+    let dur = modified
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| "no_mtime")?;
+    Ok(ApkStamp {
+        path: path_str.to_owned(),
+        mtime_secs: dur.as_secs(),
+        mtime_nanos: dur.subsec_nanos(),
+        version_code,
+        len,
+    })
+}
+
+fn read_sha_cache(dir: &Path, stamp: &ApkStamp) -> Option<String> {
+    let bytes = read_capped(&sha_cache_path(dir), SHA_CACHE_MAX).ok()?;
+    let text = std::str::from_utf8(&bytes).ok()?;
+    parse_sha_cache(text, stamp)
+}
+
+fn parse_sha_cache(text: &str, stamp: &ApkStamp) -> Option<String> {
+    let mut lines = text.lines();
+    if lines.next()? != "v1" {
+        return None;
+    }
+    let path = lines.next()?;
+    let secs: u64 = lines.next()?.parse().ok()?;
+    let nanos: u32 = lines.next()?.parse().ok()?;
+    let version: u64 = lines.next()?.parse().ok()?;
+    let len: u64 = lines.next()?.parse().ok()?;
+    let sha = lines.next()?;
+    if lines.next().is_some()
+        || path != stamp.path
+        || secs != stamp.mtime_secs
+        || nanos != stamp.mtime_nanos
+        || version != stamp.version_code
+        || len != stamp.len
+        || !sha256_hex(sha)
+    {
+        return None;
+    }
+    Some(sha.to_ascii_lowercase())
+}
+
+fn write_sha_cache(dir: &Path, stamp: &ApkStamp, sha: &str) -> Result<(), &'static str> {
+    if !sha256_hex(sha) || stamp.path.contains('\n') || stamp.path.contains('\r') {
+        return Err(UPDATE_INSTALL);
+    }
+    let body = format!(
+        "v1\n{}\n{}\n{}\n{}\n{}\n{}\n",
+        stamp.path, stamp.mtime_secs, stamp.mtime_nanos, stamp.version_code, stamp.len, sha
+    );
+    if body.len() as u64 > SHA_CACHE_MAX {
+        return Err(UPDATE_INSTALL);
+    }
+    write_regular(&sha_cache_path(dir), body.as_bytes())
+}
+
+fn sha_cache_path(dir: &Path) -> PathBuf {
+    dir.join(SHA_CACHE_FILE)
+}
+
+fn hash_regular_apk(path: &Path, len: u64) -> Result<String, &'static str> {
+    let file = File::open(path).map_err(|_| "read_apk")?;
+    let mut counted = CountRead {
+        inner: file.take(len),
+        read: 0,
+    };
+    let sha = sha256_reader_hex(&mut counted).map_err(|_| "read_apk")?;
+    if counted.read != len || !sha256_hex(&sha) {
+        return Err("read_apk");
+    }
+    Ok(sha)
+}
+
+struct CountRead<R> {
+    inner: R,
+    read: u64,
+}
+
+impl<R: Read> Read for CountRead<R> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let n = self.inner.read(buf)?;
+        self.read = self.read.saturating_add(n as u64);
+        Ok(n)
+    }
 }
 
 fn admit_apk_artifact(url: &str, size: u64, sha256: &str) -> Result<(), &'static str> {
@@ -622,7 +898,7 @@ fn lock_sha(choice: &ReleaseChoice, sums_text: Option<&str>) -> Result<Admitted,
         "https://github.com/{FORK_OWNER}/{FORK_REPO}/releases/download/{}/{}",
         choice.tag, choice.name
     );
-    let sha = if choice.has_sums {
+    let (sha, sums_sha) = if choice.has_sums {
         let text = sums_text.ok_or(UPDATE_NETWORK)?;
         if text.len() as u64 > SUMS_MAX_BYTES {
             return Err(UPDATE_CHECKSUM);
@@ -633,9 +909,9 @@ fn lock_sha(choice: &ReleaseChoice, sums_text: Option<&str>) -> Result<Admitted,
                 return Err(UPDATE_CHECKSUM);
             }
         }
-        from_sums
+        (from_sums.clone(), Some(from_sums))
     } else if let Some(digest) = &choice.digest_sha {
-        digest.clone()
+        (digest.clone(), None)
     } else {
         return Err(UPDATE_CHECKSUM);
     };
@@ -644,6 +920,7 @@ fn lock_sha(choice: &ReleaseChoice, sums_text: Option<&str>) -> Result<Admitted,
         url,
         size: choice.size,
         sha256: sha,
+        sums_sha,
     })
 }
 
@@ -1542,8 +1819,14 @@ mod tests {
         assert!(!admitted.url.contains("rustdesk/rustdesk"));
         assert!(!admitted.url.contains("api.rustdesk.com"));
         assert_eq!(admitted.sha256, DEVICE_SHA);
+        assert_eq!(admitted.sums_sha.as_deref(), Some(DEVICE_SHA));
         assert_eq!(
-            lock_sha(&choice, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n")),
+            lock_sha(
+                &choice,
+                Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n",
+                ),
+            ),
             Err(UPDATE_CHECKSUM)
         );
         assert_eq!(
@@ -1562,13 +1845,13 @@ mod tests {
         assert_eq!(android_update_arch() == "unknown", false);
         #[cfg(not(target_os = "android"))]
         {
-            assert_eq!(execute(""), semantic_action::UNSUPPORTED);
+            assert_eq!(execute("").code, semantic_action::UNSUPPORTED);
             assert_eq!(
-                execute("https://github.com/rustdesk/rustdesk/releases/tag/1.4.6"),
+                execute("https://github.com/rustdesk/rustdesk/releases/tag/1.4.6").code,
                 semantic_action::UNSUPPORTED
             );
             assert_eq!(
-                execute("https://api.rustdesk.com/version/latest"),
+                execute("https://api.rustdesk.com/version/latest").code,
                 semantic_action::UNSUPPORTED
             );
         }
@@ -1605,6 +1888,204 @@ mod tests {
         write_snapshot(&dir, &before).unwrap();
         let _ = std::fs::remove_file(config_file(&dir));
         assert_eq!(settle_dir(&dir).unwrap(), Some(UPDATE_ID_CHANGED));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn release_choice(digest: Option<&str>, has_sums: bool) -> ReleaseChoice {
+        ReleaseChoice {
+            tag: "device-e1e2e5e8e912-arm64-20261103".to_owned(),
+            name: "mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk".to_owned(),
+            size: 31,
+            digest_sha: digest.map(str::to_owned),
+            has_sums,
+        }
+    }
+
+    fn apply_skip(skip: bool, install: impl FnOnce() -> &'static str) -> &'static str {
+        if skip {
+            semantic_action::OK
+        } else {
+            install()
+        }
+    }
+
+    fn sums_line(sha: &str) -> String {
+        format!("{sha}  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n")
+    }
+
+    #[test]
+    fn same_sha_skips_cover_install() {
+        let sums = sums_line(DEVICE_SHA);
+        let from_sums = lock_sha(&release_choice(None, true), Some(&sums)).unwrap();
+        assert_eq!(from_sums.sums_sha.as_deref(), Some(DEVICE_SHA));
+        assert!(!from_sums.url.contains("rustdesk/rustdesk"));
+        assert!(!from_sums.url.contains("api.rustdesk.com"));
+        let code = apply_skip(
+            skip_same_sums(Ok(&from_sums.sha256), from_sums.sums_sha.as_deref()),
+            || panic!("download and cover-install"),
+        );
+        assert_eq!(code, semantic_action::OK);
+        assert!(semantic_action::is_peer_success(code));
+        assert_ne!(code, COMMITTED);
+        let reply = semantic_action::result_message_with_detail(
+            semantic_action::CHECK_UPDATE,
+            code,
+            semantic_action::CHECK_UPDATE_ALREADY_LATEST,
+        );
+        match reply.union {
+            Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
+                assert_eq!(result.code, semantic_action::OK);
+                assert_eq!(result.detail, "already_latest");
+            }
+            other => panic!("expected SemanticActionResult, got {other:?}"),
+        }
+        assert!(skip_same_sums(
+            Ok(&DEVICE_SHA.to_ascii_uppercase()),
+            Some(&DEVICE_SHA.to_ascii_lowercase()),
+        ));
+        assert_eq!(
+            lock_sha(&release_choice(Some(SHA_RUSTDESK), true), Some(&sums)),
+            Err(UPDATE_CHECKSUM)
+        );
+
+        let mut installs = 0u32;
+        let other = sums_line(SHA_RUSTDESK);
+        let different = lock_sha(&release_choice(None, true), Some(&other)).unwrap();
+        assert!(different.sums_sha.is_some());
+        let code = apply_skip(
+            skip_same_sums(Ok(DEVICE_SHA), different.sums_sha.as_deref()),
+            || {
+                installs += 1;
+                COMMITTED
+            },
+        );
+        assert_eq!(installs, 1);
+        assert_eq!(code, COMMITTED);
+
+        let digest_only = lock_sha(&release_choice(Some(DEVICE_SHA), false), None).unwrap();
+        assert!(digest_only.sums_sha.is_none());
+        assert_eq!(digest_only.sha256, DEVICE_SHA);
+        installs = 0;
+        let code = apply_skip(
+            skip_same_sums(Ok(DEVICE_SHA), digest_only.sums_sha.as_deref()),
+            || {
+                installs += 1;
+                COMMITTED
+            },
+        );
+        assert_eq!(installs, 1);
+        assert_eq!(code, COMMITTED);
+
+        let missing_name = format!("{DEVICE_SHA}  other.apk\n");
+        assert_eq!(
+            lock_sha(
+                &release_choice(Some(SHA_RUSTDESK), true),
+                Some(&missing_name)
+            ),
+            Err(UPDATE_CHECKSUM)
+        );
+        assert_eq!(
+            lock_sha(&release_choice(None, true), Some(&missing_name)),
+            Err(UPDATE_CHECKSUM)
+        );
+        assert_eq!(
+            lock_sha(&release_choice(Some(DEVICE_SHA), true), None),
+            Err(UPDATE_NETWORK)
+        );
+
+        installs = 0;
+        let code = apply_skip(skip_same_sums(Err("no_source"), Some(DEVICE_SHA)), || {
+            installs += 1;
+            COMMITTED
+        });
+        assert_eq!(installs, 1);
+        assert_eq!(code, COMMITTED);
+        let code = apply_skip(skip_same_sums(Err("read_apk"), Some(DEVICE_SHA)), || {
+            installs += 1;
+            COMMITTED
+        });
+        assert_eq!(installs, 2);
+        assert_eq!(code, COMMITTED);
+
+        assert_eq!(
+            lock_sha(&release_choice(None, false), None),
+            Err(UPDATE_CHECKSUM)
+        );
+        assert!(!skip_same_sums(Ok("zz"), Some(DEVICE_SHA)));
+        assert!(!skip_same_sums(Ok(DEVICE_SHA), Some("")));
+    }
+
+    #[test]
+    fn installed_sha_is_cached_until_the_apk_changes() {
+        let dir = std::env::temp_dir().join(format!(
+            "peer-apk-sha-{}-{}",
+            std::process::id(),
+            hbb_common::rand::random::<u64>()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("base.apk");
+        std::fs::write(&path, b"rustdesk").unwrap();
+        let installed = InstalledApk {
+            path: path.clone(),
+            version_code: 7,
+        };
+        let stamp = file_stamp(&path, 7).unwrap();
+        let sentinel = "ab".repeat(32);
+        write_sha_cache(&dir, &stamp, &sentinel).unwrap();
+        assert_eq!(cached_apk_sha(&dir, &installed).unwrap(), sentinel);
+
+        let stamped = ApkStamp {
+            path: stamp.path.clone(),
+            mtime_secs: stamp.mtime_secs,
+            mtime_nanos: stamp.mtime_nanos,
+            version_code: stamp.version_code,
+            len: stamp.len + 1,
+        };
+        write_sha_cache(&dir, &stamped, &sentinel).unwrap();
+        assert_eq!(cached_apk_sha(&dir, &installed).unwrap(), SHA_RUSTDESK);
+
+        let other = dir.join("other.apk");
+        std::fs::write(&other, b"rustdesk").unwrap();
+        let file = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&other)
+            .unwrap();
+        let modified = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap();
+        file.set_modified(modified).unwrap();
+        drop(file);
+        let stamp_other = file_stamp(&other, 7).unwrap();
+        assert_eq!(stamp_other.mtime_secs, stamp.mtime_secs);
+        assert_eq!(stamp_other.mtime_nanos, stamp.mtime_nanos);
+        assert_eq!(stamp_other.len, stamp.len);
+        assert_ne!(stamp_other.path, stamp.path);
+        write_sha_cache(&dir, &stamp, &sentinel).unwrap();
+        let other_apk = InstalledApk {
+            path: other.clone(),
+            version_code: 7,
+        };
+        assert_eq!(cached_apk_sha(&dir, &other_apk).unwrap(), SHA_RUSTDESK);
+
+        let bumped = InstalledApk {
+            path: path.clone(),
+            version_code: 8,
+        };
+        assert_eq!(cached_apk_sha(&dir, &bumped).unwrap(), SHA_RUSTDESK);
+        std::fs::write(&path, b"changed!").unwrap();
+        let moved = std::fs::OpenOptions::new().write(true).open(&path).unwrap();
+        let later = std::fs::symlink_metadata(&path)
+            .unwrap()
+            .modified()
+            .unwrap()
+            + Duration::from_secs(2);
+        moved.set_modified(later).unwrap();
+        drop(moved);
+        let again = cached_apk_sha(&dir, &bumped).unwrap();
+        assert_ne!(again, SHA_RUSTDESK);
+        assert_ne!(again, sentinel);
+        assert_eq!(cached_apk_sha(&dir, &bumped).unwrap(), again);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

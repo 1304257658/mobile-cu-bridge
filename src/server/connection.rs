@@ -4199,7 +4199,10 @@ impl Connection {
                         detail = outcome.detail;
                         outcome.code
                     } else if action.kind == crate::semantic_action::CHECK_UPDATE {
-                        crate::peer_apk_update::run_with_deadline(action.arg.clone()).await
+                        let reply =
+                            crate::peer_apk_update::run_with_deadline(action.arg.clone()).await;
+                        detail = reply.detail.to_owned();
+                        reply.code
                     } else {
                         crate::semantic_action::execute_on_peer(&action.kind, &action.arg)
                     };

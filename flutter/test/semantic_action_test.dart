@@ -71,5 +71,28 @@ void main() {
       expect(code, isNot(contains(semanticInjectFailed)));
       expect(code, isNot(semanticOk));
     }
+    expect(semanticUpdateAlreadyLatest, 'already_latest');
+    expect(semanticPeerSuccess(semanticUpdateAlreadyLatest), isFalse);
+    expect(semanticUpdateAlreadyLatest, isNot(semanticOk));
+    expect(semanticUpdateAlreadyLatest, isNot(contains(semanticInjectFailed)));
+  });
+
+  test('peer success is only ok and already_latest is not a code', () {
+    expect(semanticPeerSuccess(semanticOk), isTrue);
+    expect(semanticPeerSuccess(semanticUpdateAlreadyLatest), isFalse);
+    for (final code in [
+      semanticUpdateAlreadyLatest,
+      semanticUpdateNetwork,
+      semanticUpdateChecksum,
+      semanticUpdateSignature,
+      semanticUpdateInstall,
+      semanticUpdateIdChanged,
+      semanticNoSession,
+      semanticUnsupported,
+      semanticInjectFailed,
+    ]) {
+      expect(semanticPeerSuccess(code), isFalse);
+      expect(code, isNot(semanticOk));
+    }
   });
 }
