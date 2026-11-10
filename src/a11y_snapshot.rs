@@ -18,8 +18,10 @@
 //! the stuck worker abandoned, and drops that worker's late result. An
 //! abandoned worker does not clear the new lease. At most one abandoned
 //! worker stays alive; a further stuck call logs `a11y wedged` and does not
-//! start a third thread. Refs look like `g7.n3`: the generation changes on
-//! every installed snapshot, and only clickable nodes get a ref.
+//! start a third thread. That abandoned worker may still be inside the JNI
+//! call. There is no lock around it: the new worker does not wait, and the
+//! late result is dropped by token. Refs look like `g7.n3`: the generation
+//! changes on every installed snapshot, and only clickable nodes get a ref.
 
 use crate::semantic_action::{
     result_message, result_message_with_detail, validate, CLICK, OK, REF_STALE, SNAPSHOT,
@@ -32,7 +34,7 @@ use std::{
     collections::HashMap,
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
-        mpsc, Arc, Condvar, Mutex, OnceLock,
+        mpsc, Arc, Mutex, OnceLock,
     },
     thread,
     time::{Duration, Instant},
@@ -1082,76 +1084,28 @@ fn admit(kind: &str, arg: &str) -> Option<Message> {
     }
 }
 
-struct A11yGate {
-    held: Mutex<bool>,
-    cv: Condvar,
-}
-
-struct A11yGuard;
-
-impl Drop for A11yGuard {
-    fn drop(&mut self) {
-        let gate = a11y_gate();
-        let mut held = gate.held.lock().unwrap_or_else(|err| err.into_inner());
-        *held = false;
-        gate.cv.notify_one();
-    }
-}
-
-fn a11y_gate() -> &'static A11yGate {
-    static GATE: OnceLock<A11yGate> = OnceLock::new();
-    GATE.get_or_init(|| A11yGate {
-        held: Mutex::new(false),
-        cv: Condvar::new(),
-    })
-}
-
-/// Wait only until `budget`. A holder stuck inside the critical section is not
-/// preempted: this returns `None` and the caller reports `snapshot_failed`.
-fn a11y_lock_for(budget: Duration) -> Option<A11yGuard> {
-    let gate = a11y_gate();
-    let deadline = Instant::now() + budget;
-    let mut held = gate.held.lock().unwrap_or_else(|err| err.into_inner());
-    loop {
-        if !*held {
-            *held = true;
-            return Some(A11yGuard);
-        }
-        let now = Instant::now();
-        if now >= deadline {
-            return None;
-        }
-        let (guard, status) = gate
-            .cv
-            .wait_timeout(held, deadline.saturating_duration_since(now))
-            .unwrap_or_else(|err| err.into_inner());
-        held = guard;
-        if status.timed_out() && *held {
-            return None;
-        }
-    }
+/// `jni` is the accessibility call. Parse stays outside it. The lease already
+/// allows only one active worker, so this is not locked: an abandoned call
+/// still inside `jni` must not stop the new worker.
+fn snapshot_from_jni<F>(jni: F) -> Result<Collected, &'static str>
+where
+    F: FnOnce() -> Result<String, &'static str>,
+{
+    let caps = caps().map_err(|_| SNAPSHOT_FAILED)?;
+    parse_wire(&jni()?, &caps)
 }
 
 #[cfg(target_os = "android")]
 fn collect_tree() -> Result<Collected, &'static str> {
-    let caps = caps().map_err(|_| SNAPSHOT_FAILED)?;
-    let raw = {
-        let _guard = match a11y_lock_for(Duration::from_millis(caps.snapshot_timeout_ms)) {
-            Some(guard) => guard,
-            None => {
-                log::error!("semantic snapshot a11y lock busy");
-                return Err(SNAPSHOT_FAILED);
+    snapshot_from_jni(
+        || match scrap::android::call_main_service_semantic_action(SNAPSHOT, "") {
+            Ok(raw) => Ok(raw),
+            Err(e) => {
+                log::error!("semantic snapshot jni failed: {e}");
+                Err(SNAPSHOT_FAILED)
             }
-        };
-        scrap::android::call_main_service_semantic_action(SNAPSHOT, "")
-    };
-    match raw {
-        Ok(raw) => parse_wire(&raw, &caps),
-        Err(e) => {
-            log::error!("semantic snapshot jni failed: {e}");
-            Err(SNAPSHOT_FAILED)
-        }
-    }
+        },
+    )
 }
 
 #[cfg(not(target_os = "android"))]
@@ -1182,17 +1136,6 @@ fn perform_clicks(target: &Target) -> &'static str {
 #[cfg(target_os = "android")]
 fn perform_click_android(target: &Target) -> &'static str {
     let arg = encode_target(target);
-    let caps = match caps() {
-        Ok(caps) => caps,
-        Err(_) => return SNAPSHOT_FAILED,
-    };
-    let _guard = match a11y_lock_for(Duration::from_millis(caps.click_timeout_ms)) {
-        Some(guard) => guard,
-        None => {
-            log::error!("semantic click a11y lock busy");
-            return SNAPSHOT_FAILED;
-        }
-    };
     match scrap::android::call_main_service_semantic_action(CLICK, &arg) {
         Ok(code) if code == OK => OK,
         Ok(code) if code == REF_STALE => REF_STALE,
@@ -1607,13 +1550,30 @@ mod tests {
         assert_eq!(worker.join().unwrap(), OK);
     }
 
-    /// The injected worker blocks in `collect`, before `a11y_lock`. After
-    /// `flight_lease_ms` a new snapshot is `ok` and the late tree is dropped.
-    /// A second abandoned worker is refused (`a11y wedged`) so live threads
-    /// stay at or below `A11Y_THREAD_CAP`. A hang inside the lock is not
-    /// recovered: `a11y_lock_for` returns `None` until that call returns.
+    fn node_wire(text: &str, bounds: [i32; 4]) -> String {
+        format!(
+            "ok\n{{\"truncated\":false,\"reason\":\"\",\"nodes\":[{{\"cls\":\"android.widget.Button\",\"text\":\"{text}\",\"desc\":\"\",\"id\":\"com.sankuai.meituan:id/search\",\"pkg\":\"com.sankuai.meituan\",\"click\":true,\"b\":[{},{},{},{}],\"path\":[0]}}]}}",
+            bounds[0], bounds[1], bounds[2], bounds[3]
+        )
+    }
+
+    fn click_bounds(peer: &Peer, now: Instant) -> [i32; 4] {
+        let mut saw = [0; 4];
+        assert_eq!(
+            peer.click_at("g1.n0", now, |target| {
+                saw = target.bounds;
+                OK
+            }),
+            OK
+        );
+        saw
+    }
+
+    /// The hang is inside `snapshot_from_jni`, the call that used to hold
+    /// `a11y_lock`. The new request returns `ok` while that call is still
+    /// blocked. The late wire is not installed over the new ref table.
     #[test]
-    fn an_expired_lease_recovers_without_a_third_thread() {
+    fn a_jni_hang_recovers_after_the_lease_and_drops_the_late_tree() {
         let peer = Arc::new(peer());
         let t0 = Instant::now();
         let lease = Duration::from_millis(peer.caps.flight_lease_ms);
@@ -1622,9 +1582,11 @@ mod tests {
         let stuck_peer = Arc::clone(&peer);
         let stuck = thread::spawn(move || {
             stuck_peer.snapshot_with(t0, move || {
-                started_tx.send(()).unwrap();
-                let _ = release_rx.recv();
-                Ok(collect(vec![sample("LATE", vec![0], [1, 1, 2, 2])]))
+                snapshot_from_jni(|| {
+                    started_tx.send(()).unwrap();
+                    let _ = release_rx.recv();
+                    Ok(node_wire("LATE", [1, 1, 2, 2]))
+                })
             })
         });
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
@@ -1641,69 +1603,60 @@ mod tests {
 
         let after = t0 + lease;
         let fresh = peer.snapshot_with(after, || {
-            Ok(collect(vec![sample("FRESH", vec![0], [9, 9, 19, 19])]))
+            snapshot_from_jni(|| Ok(node_wire("FRESH", [9, 9, 19, 19])))
         });
         assert_eq!(fresh.code, OK);
         assert!(fresh.detail.contains("FRESH"));
         assert!(!fresh.detail.contains("LATE"));
+        assert_eq!(peer.live_workers.load(Ordering::Acquire), 1);
         assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
-        let mut saw = [0; 4];
-        assert_eq!(
-            peer.click_at("g1.n0", after, |target| {
-                saw = target.bounds;
-                OK
-            }),
-            OK
-        );
-        assert_eq!(saw, [9, 9, 19, 19]);
+        assert_eq!(click_bounds(&peer, after), [9, 9, 19, 19]);
+
+        release_tx.send(()).unwrap();
+        assert_eq!(stuck.join().unwrap().code, SNAPSHOT_FAILED);
+        assert_eq!(click_bounds(&peer, after), [9, 9, 19, 19]);
+        assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
 
         let (again_tx, again_rx) = mpsc::channel();
         let (release_again_tx, release_again_rx) = mpsc::channel::<()>();
         let again_peer = Arc::clone(&peer);
         let again = thread::spawn(move || {
             again_peer.snapshot_with(after, move || {
-                again_tx.send(()).unwrap();
-                let _ = release_again_rx.recv();
-                Ok(collect(vec![sample("LATE2", vec![0], [3, 3, 4, 4])]))
+                snapshot_from_jni(|| {
+                    again_tx.send(()).unwrap();
+                    let _ = release_again_rx.recv();
+                    Ok(node_wire("LATE2", [3, 3, 4, 4]))
+                })
             })
         });
         again_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (third_tx, third_rx) = mpsc::channel();
+        let (release_third_tx, release_third_rx) = mpsc::channel::<()>();
+        let third_peer = Arc::clone(&peer);
+        let third = thread::spawn(move || {
+            third_peer.snapshot_with(after + lease, move || {
+                snapshot_from_jni(|| {
+                    third_tx.send(()).unwrap();
+                    let _ = release_third_rx.recv();
+                    Ok(node_wire("LATE3", [5, 5, 6, 6]))
+                })
+            })
+        });
+        third_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let before_wedge = peer.threads_started();
         assert_eq!(
-            peer.snapshot_with(after + lease, || panic!("third worker"))
+            peer.snapshot_with(after + lease + lease, || panic!("third worker"))
                 .code,
             SNAPSHOT_FAILED
         );
         assert_eq!(peer.threads_started(), before_wedge);
         assert!(peer.live_workers.load(Ordering::Acquire) <= A11Y_THREAD_CAP);
         assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
-
-        release_tx.send(()).unwrap();
-        assert_eq!(stuck.join().unwrap().code, SNAPSHOT_FAILED);
         release_again_tx.send(()).unwrap();
+        release_third_tx.send(()).unwrap();
         let _ = again.join().unwrap();
+        let _ = third.join().unwrap();
         assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
-    }
-
-    #[test]
-    fn a11y_lock_wait_is_bounded_by_the_request_budget() {
-        let (release_tx, release_rx) = mpsc::channel::<()>();
-        let (held_tx, held_rx) = mpsc::channel();
-        let holder = thread::spawn(move || {
-            let guard = a11y_lock_for(Duration::from_secs(5)).expect("lock");
-            held_tx.send(()).unwrap();
-            let _ = release_rx.recv();
-            drop(guard);
-        });
-        held_rx.recv_timeout(Duration::from_secs(2)).unwrap();
-        let started = Instant::now();
-        assert!(a11y_lock_for(Duration::from_millis(80)).is_none());
-        let waited = started.elapsed();
-        assert!(waited >= Duration::from_millis(70));
-        assert!(waited < Duration::from_millis(500));
-        release_tx.send(()).unwrap();
-        holder.join().unwrap();
-        assert!(a11y_lock_for(Duration::from_millis(200)).is_some());
     }
 
     #[test]
