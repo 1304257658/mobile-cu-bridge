@@ -12,10 +12,10 @@
 //!
 //! When the installed APK sha256 equals the `SHA256SUMS` entry for that file,
 //! the peer returns `ok` with detail `already_latest` and does not download or
-//! cover-install. Asset digest alone does not skip. A missing `SHA256SUMS`, or
-//! one with no entry for the package, is logged and the same-signature
-//! cover-install continues. The local digest is cached by path, mtime, length,
-//! and versionCode.
+//! cover-install. That entry is only the skip decision. Install verification
+//! is the same as before: a declared `SHA256SUMS` that cannot be fetched is
+//! `network`, and a missing entry or a digest mismatch is `checksum`.
+//! The local digest is cached by path, mtime, length, and versionCode.
 
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
@@ -234,28 +234,20 @@ fn discover(arg: &str, deadline: Instant) -> Result<Admitted, &'static str> {
     };
     let body = fetch_limited(&url, RELEASES_JSON_MAX, deadline)?;
     let choice = choose_release(&body, arch, only_tag.as_deref(), only_name.as_deref())?;
-    let sums_text = if choice.has_sums {
+    let sums = if choice.has_sums {
         let sums_url = format!(
             "https://github.com/{FORK_OWNER}/{FORK_REPO}/releases/download/{}/SHA256SUMS",
             choice.tag
         );
-        match fetch_limited(&sums_url, SUMS_MAX_BYTES, deadline) {
-            Ok(bytes) => match std::str::from_utf8(&bytes) {
-                Ok(text) => Some(text.to_owned()),
-                Err(_) => {
-                    log::info!("peer apk SHA256SUMS is not utf-8; continue cover-install");
-                    None
-                }
-            },
-            Err(code) => {
-                log::info!("peer apk SHA256SUMS fetch failed ({code}); continue cover-install");
-                None
-            }
-        }
+        Some(fetch_limited(&sums_url, SUMS_MAX_BYTES, deadline)?)
     } else {
         None
     };
-    lock_sha(&choice, sums_text.as_deref())
+    let sums_text = match sums.as_deref() {
+        Some(bytes) => Some(std::str::from_utf8(bytes).map_err(|_| UPDATE_CHECKSUM)?),
+        None => None,
+    };
+    lock_sha(&choice, sums_text)
 }
 
 #[cfg(target_os = "android")]
@@ -906,36 +898,20 @@ fn lock_sha(choice: &ReleaseChoice, sums_text: Option<&str>) -> Result<Admitted,
         "https://github.com/{FORK_OWNER}/{FORK_REPO}/releases/download/{}/{}",
         choice.tag, choice.name
     );
-    let sums_sha = if choice.has_sums {
-        match sums_text {
-            Some(text) => {
-                if text.len() as u64 > SUMS_MAX_BYTES {
-                    return Err(UPDATE_CHECKSUM);
-                }
-                match sha_from_sums(text, &choice.name)? {
-                    Some(from_sums) => Some(from_sums),
-                    None => {
-                        log::info!(
-                            "peer apk SHA256SUMS has no entry for {}; continue cover-install",
-                            choice.name
-                        );
-                        None
-                    }
-                }
-            }
-            None => {
-                log::info!("peer apk SHA256SUMS unavailable; continue cover-install");
-                None
+    let (sha, sums_sha) = if choice.has_sums {
+        let text = sums_text.ok_or(UPDATE_NETWORK)?;
+        if text.len() as u64 > SUMS_MAX_BYTES {
+            return Err(UPDATE_CHECKSUM);
+        }
+        let from_sums = sha_from_sums(text, &choice.name)?;
+        if let Some(digest) = &choice.digest_sha {
+            if !digest.eq_ignore_ascii_case(&from_sums) {
+                return Err(UPDATE_CHECKSUM);
             }
         }
-    } else {
-        log::info!("peer apk release has no SHA256SUMS; continue cover-install");
-        None
-    };
-    let sha = if let Some(sha) = &sums_sha {
-        sha.clone()
+        (from_sums.clone(), Some(from_sums))
     } else if let Some(digest) = &choice.digest_sha {
-        digest.clone()
+        (digest.clone(), None)
     } else {
         return Err(UPDATE_CHECKSUM);
     };
@@ -948,7 +924,7 @@ fn lock_sha(choice: &ReleaseChoice, sums_text: Option<&str>) -> Result<Admitted,
     })
 }
 
-fn sha_from_sums(text: &str, filename: &str) -> Result<Option<String>, &'static str> {
+fn sha_from_sums(text: &str, filename: &str) -> Result<String, &'static str> {
     let mut found = None;
     for line in text.lines() {
         let line = line.trim();
@@ -979,7 +955,7 @@ fn sha_from_sums(text: &str, filename: &str) -> Result<Option<String>, &'static 
         }
         found = Some(sha);
     }
-    Ok(found)
+    found.ok_or(UPDATE_CHECKSUM)
 }
 
 fn finish_committed_or_fail(dir: &Path, cover_code: &str) -> &'static str {
@@ -1844,18 +1820,15 @@ mod tests {
         assert!(!admitted.url.contains("api.rustdesk.com"));
         assert_eq!(admitted.sha256, DEVICE_SHA);
         assert_eq!(admitted.sums_sha.as_deref(), Some(DEVICE_SHA));
-        let sums_not_digest = lock_sha(
-            &choice,
-            Some(
-                "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n",
-            ),
-        )
-        .unwrap();
         assert_eq!(
-            sums_not_digest.sums_sha.as_deref(),
-            Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
+            lock_sha(
+                &choice,
+                Some(
+                    "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n",
+                ),
+            ),
+            Err(UPDATE_CHECKSUM)
         );
-        assert_ne!(sums_not_digest.sha256, DEVICE_SHA);
         assert_eq!(
             choose_release(list.as_bytes(), "x86_64", None, None),
             Err(semantic_action::UNSUPPORTED)
@@ -1970,18 +1943,10 @@ mod tests {
             Ok(&DEVICE_SHA.to_ascii_uppercase()),
             Some(&DEVICE_SHA.to_ascii_lowercase()),
         ));
-        let digest_disagrees =
-            lock_sha(&release_choice(Some(SHA_RUSTDESK), true), Some(&sums)).unwrap();
-        assert_eq!(digest_disagrees.sums_sha.as_deref(), Some(DEVICE_SHA));
-        assert_eq!(digest_disagrees.sha256, DEVICE_SHA);
-        assert!(skip_same_sums(
-            Ok(DEVICE_SHA),
-            digest_disagrees.sums_sha.as_deref(),
-        ));
-        assert!(!skip_same_sums(
-            Ok(SHA_RUSTDESK),
-            digest_disagrees.sums_sha.as_deref(),
-        ));
+        assert_eq!(
+            lock_sha(&release_choice(Some(SHA_RUSTDESK), true), Some(&sums)),
+            Err(UPDATE_CHECKSUM)
+        );
 
         let mut installs = 0u32;
         let other = sums_line(SHA_RUSTDESK);
@@ -2012,38 +1977,21 @@ mod tests {
         assert_eq!(code, COMMITTED);
 
         let missing_name = format!("{DEVICE_SHA}  other.apk\n");
-        let no_entry = lock_sha(
-            &release_choice(Some(SHA_RUSTDESK), true),
-            Some(&missing_name),
-        )
-        .unwrap();
-        assert!(no_entry.sums_sha.is_none());
-        assert_eq!(no_entry.sha256, SHA_RUSTDESK);
-        installs = 0;
-        let code = apply_skip(
-            skip_same_sums(Ok(SHA_RUSTDESK), no_entry.sums_sha.as_deref()),
-            || {
-                installs += 1;
-                COMMITTED
-            },
+        assert_eq!(
+            lock_sha(
+                &release_choice(Some(SHA_RUSTDESK), true),
+                Some(&missing_name)
+            ),
+            Err(UPDATE_CHECKSUM)
         );
-        assert_eq!(installs, 1);
-        assert_eq!(code, COMMITTED);
         assert_eq!(
             lock_sha(&release_choice(None, true), Some(&missing_name)),
             Err(UPDATE_CHECKSUM)
         );
-        let unavailable = lock_sha(&release_choice(Some(DEVICE_SHA), true), None).unwrap();
-        assert!(unavailable.sums_sha.is_none());
-        installs = 0;
-        let code = apply_skip(
-            skip_same_sums(Ok(DEVICE_SHA), unavailable.sums_sha.as_deref()),
-            || {
-                installs += 1;
-                COMMITTED
-            },
+        assert_eq!(
+            lock_sha(&release_choice(Some(DEVICE_SHA), true), None),
+            Err(UPDATE_NETWORK)
         );
-        assert_eq!(installs, 1);
 
         installs = 0;
         let code = apply_skip(skip_same_sums(Err("no_source"), Some(DEVICE_SHA)), || {
