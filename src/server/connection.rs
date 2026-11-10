@@ -4199,7 +4199,10 @@ impl Connection {
                         detail = outcome.detail;
                         outcome.code
                     } else if action.kind == crate::semantic_action::CHECK_UPDATE {
-                        crate::peer_apk_update::run_with_deadline(action.arg.clone()).await
+                        let reply =
+                            crate::peer_apk_update::run_with_deadline(action.arg.clone()).await;
+                        detail = reply.detail.to_owned();
+                        reply.code
                     } else {
                         crate::semantic_action::execute_on_peer(&action.kind, &action.arg)
                     };
@@ -4210,9 +4213,7 @@ impl Connection {
                         self.update_auto_disconnect_timer();
                         return true;
                     }
-                    if code != crate::semantic_action::OK
-                        && code != crate::semantic_action::UPDATE_ALREADY_LATEST
-                    {
+                    if code != crate::semantic_action::OK {
                         log::warn!("semantic action {} -> {code}", action.kind);
                     }
                     let msg = if detail.is_empty() {

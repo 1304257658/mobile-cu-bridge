@@ -10,10 +10,12 @@
 //! `enc_id` are written to disk first. The next process compares that snapshot
 //! and the controller hears `ok` or `id_changed` when it reconnects.
 //!
-//! When the installed APK sha256 already equals that release sha256, the peer
-//! returns `already_latest` and does not download or cover-install. The local
-//! digest is cached by path, mtime, length, and versionCode. A missing digest
-//! keeps the cover-install path.
+//! When the installed APK sha256 equals the `SHA256SUMS` entry for that file,
+//! the peer returns `ok` with detail `already_latest` and does not download or
+//! cover-install. Asset digest alone does not skip. A missing `SHA256SUMS`, or
+//! one with no entry for the package, is logged and the same-signature
+//! cover-install continues. The local digest is cached by path, mtime, length,
+//! and versionCode.
 
 #![cfg_attr(not(target_os = "android"), allow(dead_code))]
 
@@ -66,11 +68,31 @@ const RELEASES_API: &str =
 /// The process is expected to die. `ok` / `id_changed` are reported after restart.
 pub(crate) const COMMITTED: &str = "committed";
 
+pub(crate) struct CheckUpdateReply {
+    pub code: &'static str,
+    pub detail: &'static str,
+}
+
+impl CheckUpdateReply {
+    fn bare(code: &'static str) -> Self {
+        Self { code, detail: "" }
+    }
+
+    fn skipped() -> Self {
+        Self {
+            code: semantic_action::OK,
+            detail: semantic_action::CHECK_UPDATE_ALREADY_LATEST,
+        }
+    }
+}
+
 #[derive(Debug, PartialEq)]
 struct Admitted {
     url: String,
     size: u64,
     sha256: String,
+    /// Set only when `SHA256SUMS` names this file. Absent means do not skip.
+    sums_sha: Option<String>,
 }
 
 #[derive(Debug)]
@@ -90,28 +112,28 @@ impl IdMaterial {
     }
 }
 
-pub(crate) async fn run_with_deadline(arg: String) -> &'static str {
+pub(crate) async fn run_with_deadline(arg: String) -> CheckUpdateReply {
     match hbb_common::timeout(
         BLOCKING_TIMEOUT_MS,
         hbb_common::tokio::task::spawn_blocking(move || execute(&arg)),
     )
     .await
     {
-        Ok(Ok(code)) => code,
+        Ok(Ok(reply)) => reply,
         Ok(Err(e)) => {
             log::error!("peer apk update task failed: {e}");
-            UPDATE_INSTALL
+            CheckUpdateReply::bare(UPDATE_INSTALL)
         }
         Err(_) => {
             log::error!("peer apk update exceeded {BLOCKING_TIMEOUT_MS} ms");
-            UPDATE_NETWORK
+            CheckUpdateReply::bare(UPDATE_NETWORK)
         }
     }
 }
 
-pub(crate) fn execute(arg: &str) -> &'static str {
+pub(crate) fn execute(arg: &str) -> CheckUpdateReply {
     if semantic_action::validate(semantic_action::CHECK_UPDATE, arg) != semantic_action::OK {
-        return semantic_action::UNSUPPORTED;
+        return CheckUpdateReply::bare(semantic_action::UNSUPPORTED);
     }
     #[cfg(target_os = "android")]
     {
@@ -120,30 +142,33 @@ pub(crate) fn execute(arg: &str) -> &'static str {
     #[cfg(not(target_os = "android"))]
     {
         let _ = arg;
-        semantic_action::UNSUPPORTED
+        CheckUpdateReply::bare(semantic_action::UNSUPPORTED)
     }
 }
 
 #[cfg(target_os = "android")]
-fn execute_android(arg: &str) -> &'static str {
+fn execute_android(arg: &str) -> CheckUpdateReply {
     let deadline = Instant::now() + INNER_BUDGET;
     let Some(dir) = config_dir() else {
-        return UPDATE_INSTALL;
+        return CheckUpdateReply::bare(UPDATE_INSTALL);
     };
     if let Some(code) = take_verdict(&dir) {
-        return code;
+        return CheckUpdateReply::bare(code);
     }
     let artifact = match discover(arg, deadline) {
         Ok(artifact) => artifact,
-        Err(code) => return code,
+        Err(code) => return CheckUpdateReply::bare(code),
     };
-    if let Some(code) = cover_decision(local_installed_sha(&dir).as_deref(), &artifact.sha256) {
+    if skip_same_sums(
+        local_installed_sha(&dir).as_deref(),
+        artifact.sums_sha.as_deref(),
+    ) {
         log::info!("peer apk already_latest; skip download and cover-install");
-        return code;
+        return CheckUpdateReply::skipped();
     }
     let before = match snapshot_id() {
         Ok(id) => id,
-        Err(code) => return code,
+        Err(code) => return CheckUpdateReply::bare(code),
     };
     let dest = apk_dest();
     let downloaded = download_apk(
@@ -178,7 +203,7 @@ fn execute_android(arg: &str) -> &'static str {
     if code != semantic_action::OK && code != COMMITTED {
         log::error!("peer apk check_update -> {code}");
     }
-    code
+    CheckUpdateReply::bare(code)
 }
 
 #[cfg(target_os = "android")]
@@ -209,20 +234,28 @@ fn discover(arg: &str, deadline: Instant) -> Result<Admitted, &'static str> {
     };
     let body = fetch_limited(&url, RELEASES_JSON_MAX, deadline)?;
     let choice = choose_release(&body, arch, only_tag.as_deref(), only_name.as_deref())?;
-    let sums = if choice.has_sums {
+    let sums_text = if choice.has_sums {
         let sums_url = format!(
             "https://github.com/{FORK_OWNER}/{FORK_REPO}/releases/download/{}/SHA256SUMS",
             choice.tag
         );
-        Some(fetch_limited(&sums_url, SUMS_MAX_BYTES, deadline)?)
+        match fetch_limited(&sums_url, SUMS_MAX_BYTES, deadline) {
+            Ok(bytes) => match std::str::from_utf8(&bytes) {
+                Ok(text) => Some(text.to_owned()),
+                Err(_) => {
+                    log::info!("peer apk SHA256SUMS is not utf-8; continue cover-install");
+                    None
+                }
+            },
+            Err(code) => {
+                log::info!("peer apk SHA256SUMS fetch failed ({code}); continue cover-install");
+                None
+            }
+        }
     } else {
         None
     };
-    let sums_text = match sums.as_deref() {
-        Some(bytes) => Some(std::str::from_utf8(bytes).map_err(|_| UPDATE_CHECKSUM)?),
-        None => None,
-    };
-    lock_sha(&choice, sums_text)
+    lock_sha(&choice, sums_text.as_deref())
 }
 
 #[cfg(target_os = "android")]
@@ -392,24 +425,24 @@ fn remaining(deadline: Instant) -> Duration {
     deadline.saturating_duration_since(Instant::now())
 }
 
-/// `Some(already_latest)` means do not download or cover-install.
-/// `None` means keep the cover-install path.
-fn cover_decision(local: Result<&str, &'static str>, release_sha: &str) -> Option<&'static str> {
+/// True only when `sums_sha` came from `SHA256SUMS` and matches the installed file.
+fn skip_same_sums(local: Result<&str, &'static str>, sums_sha: Option<&str>) -> bool {
+    let Some(release_sha) = sums_sha else {
+        return false;
+    };
     match local {
-        Ok(local) if same_apk_sha(local, release_sha) => {
-            Some(semantic_action::UPDATE_ALREADY_LATEST)
-        }
+        Ok(local) if same_apk_sha(local, release_sha) => true,
         Ok(local) if sha256_hex(local) && sha256_hex(release_sha) => {
-            log::info!("peer apk sha differs from release; cover-install");
-            None
+            log::info!("peer apk sha differs from SHA256SUMS; cover-install");
+            false
         }
         Ok(_) => {
             log::info!("peer apk local sha unavailable (bad_sha); continue cover-install");
-            None
+            false
         }
         Err(reason) => {
             log::info!("peer apk local sha unavailable ({reason}); continue cover-install");
-            None
+            false
         }
     }
 }
@@ -873,18 +906,41 @@ fn lock_sha(choice: &ReleaseChoice, sums_text: Option<&str>) -> Result<Admitted,
         "https://github.com/{FORK_OWNER}/{FORK_REPO}/releases/download/{}/{}",
         choice.tag, choice.name
     );
-    let sha = if choice.has_sums {
-        let text = sums_text.ok_or(UPDATE_NETWORK)?;
-        if text.len() as u64 > SUMS_MAX_BYTES {
-            return Err(UPDATE_CHECKSUM);
-        }
-        let from_sums = sha_from_sums(text, &choice.name)?;
-        if let Some(digest) = &choice.digest_sha {
-            if !digest.eq_ignore_ascii_case(&from_sums) {
-                return Err(UPDATE_CHECKSUM);
+    let sums_sha = if choice.has_sums {
+        match sums_text {
+            Some(text) => {
+                if text.len() as u64 > SUMS_MAX_BYTES {
+                    return Err(UPDATE_CHECKSUM);
+                }
+                match sha_from_sums(text, &choice.name)? {
+                    Some(from_sums) => {
+                        if let Some(digest) = &choice.digest_sha {
+                            if !digest.eq_ignore_ascii_case(&from_sums) {
+                                return Err(UPDATE_CHECKSUM);
+                            }
+                        }
+                        Some(from_sums)
+                    }
+                    None => {
+                        log::info!(
+                            "peer apk SHA256SUMS has no entry for {}; continue cover-install",
+                            choice.name
+                        );
+                        None
+                    }
+                }
+            }
+            None => {
+                log::info!("peer apk SHA256SUMS unavailable; continue cover-install");
+                None
             }
         }
-        from_sums
+    } else {
+        log::info!("peer apk release has no SHA256SUMS; continue cover-install");
+        None
+    };
+    let sha = if let Some(sha) = &sums_sha {
+        sha.clone()
     } else if let Some(digest) = &choice.digest_sha {
         digest.clone()
     } else {
@@ -895,10 +951,11 @@ fn lock_sha(choice: &ReleaseChoice, sums_text: Option<&str>) -> Result<Admitted,
         url,
         size: choice.size,
         sha256: sha,
+        sums_sha,
     })
 }
 
-fn sha_from_sums(text: &str, filename: &str) -> Result<String, &'static str> {
+fn sha_from_sums(text: &str, filename: &str) -> Result<Option<String>, &'static str> {
     let mut found = None;
     for line in text.lines() {
         let line = line.trim();
@@ -929,7 +986,7 @@ fn sha_from_sums(text: &str, filename: &str) -> Result<String, &'static str> {
         }
         found = Some(sha);
     }
-    found.ok_or(UPDATE_CHECKSUM)
+    Ok(found)
 }
 
 fn finish_committed_or_fail(dir: &Path, cover_code: &str) -> &'static str {
@@ -1793,6 +1850,7 @@ mod tests {
         assert!(!admitted.url.contains("rustdesk/rustdesk"));
         assert!(!admitted.url.contains("api.rustdesk.com"));
         assert_eq!(admitted.sha256, DEVICE_SHA);
+        assert_eq!(admitted.sums_sha.as_deref(), Some(DEVICE_SHA));
         assert_eq!(
             lock_sha(&choice, Some("aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n")),
             Err(UPDATE_CHECKSUM)
@@ -1813,13 +1871,13 @@ mod tests {
         assert_eq!(android_update_arch() == "unknown", false);
         #[cfg(not(target_os = "android"))]
         {
-            assert_eq!(execute(""), semantic_action::UNSUPPORTED);
+            assert_eq!(execute("").code, semantic_action::UNSUPPORTED);
             assert_eq!(
-                execute("https://github.com/rustdesk/rustdesk/releases/tag/1.4.6"),
+                execute("https://github.com/rustdesk/rustdesk/releases/tag/1.4.6").code,
                 semantic_action::UNSUPPORTED
             );
             assert_eq!(
-                execute("https://api.rustdesk.com/version/latest"),
+                execute("https://api.rustdesk.com/version/latest").code,
                 semantic_action::UNSUPPORTED
             );
         }
@@ -1869,54 +1927,119 @@ mod tests {
         }
     }
 
-    fn apply_decision(
-        decision: Option<&'static str>,
-        install: impl FnOnce() -> &'static str,
-    ) -> &'static str {
-        if let Some(code) = decision {
-            return code;
+    fn apply_skip(skip: bool, install: impl FnOnce() -> &'static str) -> &'static str {
+        if skip {
+            semantic_action::OK
+        } else {
+            install()
         }
-        install()
+    }
+
+    fn sums_line(sha: &str) -> String {
+        format!("{sha}  mobile-cu-bridge-e1e2e5e8e912-arm64-release.apk\n")
     }
 
     #[test]
     fn same_sha_skips_cover_install() {
-        let from_digest = lock_sha(&release_choice(Some(DEVICE_SHA), false), None).unwrap();
-        assert_eq!(from_digest.sha256, DEVICE_SHA);
-        assert!(!from_digest.url.contains("rustdesk/rustdesk"));
-        assert!(!from_digest.url.contains("api.rustdesk.com"));
-        let code = apply_decision(
-            cover_decision(Ok(&from_digest.sha256), &from_digest.sha256),
+        let sums = sums_line(DEVICE_SHA);
+        let from_sums = lock_sha(&release_choice(Some(DEVICE_SHA), true), Some(&sums)).unwrap();
+        assert_eq!(from_sums.sums_sha.as_deref(), Some(DEVICE_SHA));
+        assert!(!from_sums.url.contains("rustdesk/rustdesk"));
+        assert!(!from_sums.url.contains("api.rustdesk.com"));
+        let code = apply_skip(
+            skip_same_sums(Ok(&from_sums.sha256), from_sums.sums_sha.as_deref()),
             || panic!("download and cover-install"),
         );
-        assert_eq!(code, semantic_action::UPDATE_ALREADY_LATEST);
+        assert_eq!(code, semantic_action::OK);
         assert!(semantic_action::is_peer_success(code));
-        assert_ne!(code, semantic_action::OK);
         assert_ne!(code, COMMITTED);
-        let code = apply_decision(
-            cover_decision(Ok(&DEVICE_SHA.to_ascii_uppercase()), DEVICE_SHA),
-            || panic!("download and cover-install"),
+        let reply = semantic_action::result_message_with_detail(
+            semantic_action::CHECK_UPDATE,
+            code,
+            semantic_action::CHECK_UPDATE_ALREADY_LATEST,
         );
-        assert_eq!(code, semantic_action::UPDATE_ALREADY_LATEST);
+        match reply.union {
+            Some(base::message_proto::message::Union::SemanticActionResult(result)) => {
+                assert_eq!(result.code, semantic_action::OK);
+                assert_eq!(result.detail, "already_latest");
+            }
+            other => panic!("expected SemanticActionResult, got {other:?}"),
+        }
+        assert!(skip_same_sums(
+            Ok(&DEVICE_SHA.to_ascii_uppercase()),
+            Some(&DEVICE_SHA.to_ascii_lowercase()),
+        ));
 
         let mut installs = 0u32;
-        let code = apply_decision(cover_decision(Ok(SHA_RUSTDESK), DEVICE_SHA), || {
-            installs += 1;
-            COMMITTED
-        });
+        let other = sums_line(SHA_RUSTDESK);
+        let different = lock_sha(&release_choice(None, true), Some(&other)).unwrap();
+        assert!(different.sums_sha.is_some());
+        let code = apply_skip(
+            skip_same_sums(Ok(DEVICE_SHA), different.sums_sha.as_deref()),
+            || {
+                installs += 1;
+                COMMITTED
+            },
+        );
         assert_eq!(installs, 1);
         assert_eq!(code, COMMITTED);
-        assert_ne!(code, semantic_action::UPDATE_ALREADY_LATEST);
+
+        let digest_only = lock_sha(&release_choice(Some(DEVICE_SHA), false), None).unwrap();
+        assert!(digest_only.sums_sha.is_none());
+        assert_eq!(digest_only.sha256, DEVICE_SHA);
+        installs = 0;
+        let code = apply_skip(
+            skip_same_sums(Ok(DEVICE_SHA), digest_only.sums_sha.as_deref()),
+            || {
+                installs += 1;
+                COMMITTED
+            },
+        );
+        assert_eq!(installs, 1);
+        assert_eq!(code, COMMITTED);
+
+        let missing_name = format!("{DEVICE_SHA}  other.apk\n");
+        let no_entry = lock_sha(
+            &release_choice(Some(SHA_RUSTDESK), true),
+            Some(&missing_name),
+        )
+        .unwrap();
+        assert!(no_entry.sums_sha.is_none());
+        assert_eq!(no_entry.sha256, SHA_RUSTDESK);
+        installs = 0;
+        let code = apply_skip(
+            skip_same_sums(Ok(SHA_RUSTDESK), no_entry.sums_sha.as_deref()),
+            || {
+                installs += 1;
+                COMMITTED
+            },
+        );
+        assert_eq!(installs, 1);
+        assert_eq!(code, COMMITTED);
+        assert_eq!(
+            lock_sha(&release_choice(None, true), Some(&missing_name)),
+            Err(UPDATE_CHECKSUM)
+        );
+        let unavailable = lock_sha(&release_choice(Some(DEVICE_SHA), true), None).unwrap();
+        assert!(unavailable.sums_sha.is_none());
+        installs = 0;
+        let code = apply_skip(
+            skip_same_sums(Ok(DEVICE_SHA), unavailable.sums_sha.as_deref()),
+            || {
+                installs += 1;
+                COMMITTED
+            },
+        );
+        assert_eq!(installs, 1);
 
         installs = 0;
-        let code = apply_decision(cover_decision(Err("no_source"), DEVICE_SHA), || {
+        let code = apply_skip(skip_same_sums(Err("no_source"), Some(DEVICE_SHA)), || {
             installs += 1;
             COMMITTED
         });
         assert_eq!(installs, 1);
         assert_eq!(code, COMMITTED);
-        assert_ne!(code, semantic_action::UPDATE_ALREADY_LATEST);
-        let code = apply_decision(cover_decision(Err("read_apk"), DEVICE_SHA), || {
+        let code = apply_skip(skip_same_sums(Err("read_apk"), Some(DEVICE_SHA)), || {
             installs += 1;
             COMMITTED
         });
@@ -1927,8 +2050,8 @@ mod tests {
             lock_sha(&release_choice(None, false), None),
             Err(UPDATE_CHECKSUM)
         );
-        assert_eq!(cover_decision(Ok("zz"), DEVICE_SHA), None);
-        assert_eq!(cover_decision(Ok(DEVICE_SHA), ""), None);
+        assert!(!skip_same_sums(Ok("zz"), Some(DEVICE_SHA)));
+        assert!(!skip_same_sums(Ok(DEVICE_SHA), Some("")));
     }
 
     #[test]
