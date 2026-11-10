@@ -17,12 +17,12 @@
 //! starts no thread. After the lease, the next call reclaims the slot, marks
 //! the stuck worker abandoned, and drops that worker's late result. An
 //! abandoned worker does not clear the new lease. At most one abandoned
-//! worker stays alive; a further stuck call logs `a11y wedged` and does not
-//! start a third thread. That abandoned worker may still be inside the JNI
-//! call. There is no lock around it: the new worker does not wait, and the
-//! late result is dropped by token. A second stuck worker, with the abandoned
-//! one still alive, restarts this process once per ten minutes. Refs look
-//! like `g7.n3`: the generation changes on every installed snapshot. Only
+//! worker stays alive. When that one is still alive and the current lease has
+//! also expired, the call returns `snapshot_failed` with detail
+//! `a11y_wedged` and does not start a third thread. The thread count is only
+//! in the log. A stuck JNI call that later returns drops its own slot, and
+//! the next request can succeed. There is no process restart. Refs look like
+//! `g7.n3`: the generation changes on every installed snapshot. Only
 //! clickable nodes get a ref, and at most 80 of them. Other nodes stay in the
 //! tree with their text and no ref.
 
@@ -35,21 +35,20 @@ use hbb_common::log;
 use serde_json::Value;
 use std::{
     collections::HashMap,
-    fs,
-    io::Write,
-    path::{Path, PathBuf},
     sync::{
         atomic::{AtomicU64, AtomicUsize, Ordering},
         mpsc, Arc, Mutex, OnceLock,
     },
     thread,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant},
 };
 
 /// Current worker plus at most one abandoned worker. The timeout reply is not a thread.
 const A11Y_THREAD_CAP: usize = 2;
-/// One in-place restart per ten minutes. The stamp is on disk, so a new process sees it.
-const HEAL_COOLDOWN_MS: u64 = 10 * 60 * 1000;
+
+/// Exact `detail` when the abandoned slot is full and the current lease is
+/// expired. The controller matches this string. Thread count stays in the log.
+pub const A11Y_WEDGED: &str = "a11y_wedged";
 
 const CAPS_JSON: &str =
     include_str!("../flutter/android/app/src/main/assets/a11y_snapshot_caps.json");
@@ -122,8 +121,11 @@ pub struct Peer {
     spawns: Arc<AtomicUsize>,
     gen: AtomicU64,
     table: Mutex<RefTable>,
-    heal_path: PathBuf,
-    restarts: Arc<AtomicUsize>,
+}
+
+enum Refuse {
+    Held,
+    Wedged,
 }
 
 struct Flight {
@@ -213,57 +215,14 @@ pub fn accept_snapshot_detail(detail: &str) -> Result<String, ()> {
     }
 }
 
-struct HealMark {
-    count: u64,
-    at_ms: u64,
-}
-
-/// Not the device-id toml. A restart must keep that file as it is.
-fn persistent_heal_path() -> PathBuf {
-    hbb_common::config::Config::path("a11y-heal")
-}
-
-fn wall_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| u64::try_from(d.as_millis()).unwrap_or(u64::MAX))
-        .unwrap_or(0)
-}
-
-fn read_heal(path: &Path) -> Option<HealMark> {
-    if !path.exists() {
-        return Some(HealMark { count: 0, at_ms: 0 });
+fn refuse_outcome(why: Refuse) -> Outcome {
+    match why {
+        Refuse::Held => Outcome::fail(),
+        Refuse::Wedged => Outcome {
+            code: SNAPSHOT_FAILED,
+            detail: A11Y_WEDGED.to_owned(),
+        },
     }
-    let text = fs::read_to_string(path).ok()?;
-    let mut count = None;
-    let mut at_ms = None;
-    for line in text.lines() {
-        if let Some(v) = line.strip_prefix("count=") {
-            count = v.parse().ok();
-        } else if let Some(v) = line.strip_prefix("at_ms=") {
-            at_ms = v.parse().ok();
-        } else if !line.is_empty() {
-            return None;
-        }
-    }
-    Some(HealMark {
-        count: count?,
-        at_ms: at_ms?,
-    })
-}
-
-fn write_heal(path: &Path, mark: &HealMark) -> bool {
-    if let Some(dir) = path.parent() {
-        if !dir.as_os_str().is_empty() && fs::create_dir_all(dir).is_err() {
-            return false;
-        }
-    }
-    let body = format!("count={}\nat_ms={}\n", mark.count, mark.at_ms);
-    let mut file = match fs::File::create(path) {
-        Ok(file) => file,
-        Err(_) => return false,
-    };
-    file.write_all(body.as_bytes()).is_ok() && file.sync_all().is_ok()
 }
 
 fn peer() -> Option<&'static Peer> {
@@ -273,10 +232,6 @@ fn peer() -> Option<&'static Peer> {
 
 impl Peer {
     pub fn new(caps: Caps) -> Self {
-        Self::with_heal_path(caps, persistent_heal_path())
-    }
-
-    fn with_heal_path(caps: Caps, heal_path: PathBuf) -> Self {
         Self {
             caps,
             flight: Arc::new(Mutex::new(Flight {
@@ -292,8 +247,6 @@ impl Peer {
             table: Mutex::new(RefTable {
                 entries: HashMap::new(),
             }),
-            heal_path,
-            restarts: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -305,60 +258,7 @@ impl Peer {
         self.peak_workers.load(Ordering::Acquire)
     }
 
-    fn restarts(&self) -> usize {
-        self.restarts.load(Ordering::Acquire)
-    }
-
-    fn heal_count(&self) -> Option<u64> {
-        read_heal(&self.heal_path).map(|mark| mark.count)
-    }
-
-    /// Abandoned worker still alive and the current lease has expired.
-    /// Persist first, then ask Android to restart. A failed alarm rolls the
-    /// stamp back so a kill loop cannot burn the cooldown.
-    fn wedge(&self) {
-        let now = wall_ms();
-        let Some(prev) = read_heal(&self.heal_path) else {
-            log::error!("a11y wedged");
-            return;
-        };
-        if now == 0 || (prev.at_ms != 0 && now.saturating_sub(prev.at_ms) < HEAL_COOLDOWN_MS) {
-            log::error!("a11y wedged");
-            return;
-        }
-        let next = HealMark {
-            count: prev.count.saturating_add(1),
-            at_ms: now,
-        };
-        if !write_heal(&self.heal_path, &next) {
-            log::error!("a11y wedged");
-            return;
-        }
-        if !self.arm_restart() {
-            let _ = write_heal(&self.heal_path, &prev);
-            log::error!("a11y wedged");
-        }
-    }
-
-    #[cfg(all(target_os = "android", not(test)))]
-    fn arm_restart(&self) -> bool {
-        match scrap::android::call_main_service_a11y_restart() {
-            Ok(true) => true,
-            Ok(false) => false,
-            Err(e) => {
-                log::error!("a11y restart failed: {e}");
-                false
-            }
-        }
-    }
-
-    #[cfg(any(not(target_os = "android"), test))]
-    fn arm_restart(&self) -> bool {
-        self.restarts.fetch_add(1, Ordering::AcqRel);
-        true
-    }
-
-    fn acquire(&self, now: Instant) -> Result<Permit, ()> {
+    fn acquire(&self, now: Instant) -> Result<Permit, Refuse> {
         let mut flight = self.flight.lock().unwrap();
         let lease = Duration::from_millis(self.caps.flight_lease_ms);
         let live = self.live_workers.load(Ordering::Acquire);
@@ -366,22 +266,18 @@ impl Peer {
             let expired = now.saturating_duration_since(flight.since) >= lease;
             if !expired {
                 log::error!("semantic a11y refused: one action is already running");
-                return Err(());
+                return Err(Refuse::Held);
             }
             if flight.abandoned != 0 || live >= A11Y_THREAD_CAP {
-                let heal = flight.abandoned != 0;
+                let wedged = flight.abandoned != 0;
                 drop(flight);
-                if heal {
-                    self.wedge();
-                } else {
-                    log::error!("a11y wedged");
-                }
-                return Err(());
+                log::error!("a11y wedged threads={live}");
+                return Err(if wedged { Refuse::Wedged } else { Refuse::Held });
             }
             flight.abandoned = flight.holder;
         } else if live >= A11Y_THREAD_CAP {
-            log::error!("a11y wedged");
-            return Err(());
+            log::error!("a11y wedged threads={live}");
+            return Err(Refuse::Held);
         }
         flight.next = flight.next.saturating_add(1);
         let token = flight.next;
@@ -400,15 +296,12 @@ impl Peer {
         self.flight.lock().unwrap().holder == token
     }
 
-    /// Start at most one new worker. `false` starts nothing.
-    fn try_spawn<F>(&self, now: Instant, work: F) -> bool
+    /// Start at most one new worker. `Err` starts nothing.
+    fn try_spawn<F>(&self, now: Instant, work: F) -> Result<(), Refuse>
     where
         F: FnOnce(Permit) + Send + 'static,
     {
-        let mut permit = match self.acquire(now) {
-            Ok(permit) => permit,
-            Err(()) => return false,
-        };
+        let mut permit = self.acquire(now)?;
         let n = self.live_workers.fetch_add(1, Ordering::AcqRel) + 1;
         self.peak_workers.fetch_max(n, Ordering::AcqRel);
         permit.counted = true;
@@ -417,11 +310,11 @@ impl Peer {
             .name("a11y-action".into())
             .spawn(move || work(permit))
         {
-            Ok(_) => true,
+            Ok(_) => Ok(()),
             Err(e) => {
                 self.spawns.fetch_sub(1, Ordering::AcqRel);
                 log::error!("semantic a11y thread failed: {e}");
-                false
+                Err(Refuse::Held)
             }
         }
     }
@@ -433,7 +326,7 @@ impl Peer {
         let (tx, rx) = mpsc::channel();
         let (ack_tx, ack_rx) = mpsc::channel::<()>();
         let (done_tx, done_rx) = mpsc::channel::<()>();
-        if !self.try_spawn(now, move |mut permit| {
+        if let Err(why) = self.try_spawn(now, move |mut permit| {
             let token = permit.token();
             let result = collect();
             let _ = tx.send((token, result));
@@ -441,7 +334,7 @@ impl Peer {
             permit.conclude();
             let _ = done_tx.send(());
         }) {
-            return Outcome::fail();
+            return refuse_outcome(why);
         }
         let timeout = Duration::from_millis(self.caps.snapshot_timeout_ms);
         match rx.recv_timeout(timeout) {
@@ -487,7 +380,7 @@ impl Peer {
         };
         let mut permit = match self.acquire(now) {
             Ok(permit) => permit,
-            Err(()) => return SNAPSHOT_FAILED,
+            Err(_) => return SNAPSHOT_FAILED,
         };
         let code = perform_all(&targets, &mut perform);
         if permit.conclude() {
@@ -506,12 +399,15 @@ impl Peer {
             Err(code) => return code,
         };
         let (tx, rx) = mpsc::channel();
-        if !self.try_spawn(now, move |mut permit| {
-            let code = perform_all(&targets, &mut perform);
-            if permit.conclude() {
-                let _ = tx.send(code);
-            }
-        }) {
+        if self
+            .try_spawn(now, move |mut permit| {
+                let code = perform_all(&targets, &mut perform);
+                if permit.conclude() {
+                    let _ = tx.send(code);
+                }
+            })
+            .is_err()
+        {
             return SNAPSHOT_FAILED;
         }
         match rx.recv_timeout(Duration::from_millis(self.caps.click_timeout_ms)) {
@@ -1170,8 +1066,11 @@ pub fn dispatch(kind: String, arg: String, send: impl FnOnce(Message) + Send + '
             }
         })
     };
-    if !started {
-        send(result_message(&kind, SNAPSHOT_FAILED));
+    if let Err(why) = started {
+        send(match why {
+            Refuse::Wedged => result_message_with_detail(&kind, SNAPSHOT_FAILED, A11Y_WEDGED),
+            Refuse::Held => result_message(&kind, SNAPSHOT_FAILED),
+        });
         return;
     }
     arm_timeout(rx, timeout, kind, send);
@@ -1337,12 +1236,7 @@ mod tests {
     }
 
     fn peer() -> Peer {
-        static N: AtomicU64 = AtomicU64::new(0);
-        let n = N.fetch_add(1, Ordering::Relaxed);
-        Peer::with_heal_path(
-            caps_ok(),
-            std::env::temp_dir().join(format!("a11y-heal-{}-{n}", std::process::id())),
-        )
+        Peer::new(caps_ok())
     }
 
     #[test]
@@ -1767,11 +1661,9 @@ mod tests {
         started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let during = t0 + lease - Duration::from_millis(1);
         let held = peer.threads_started();
-        assert_eq!(
-            peer.snapshot_with(during, || panic!("request inside the lease"))
-                .code,
-            SNAPSHOT_FAILED
-        );
+        let busy = peer.snapshot_with(during, || panic!("request inside the lease"));
+        assert_eq!(busy.code, SNAPSHOT_FAILED);
+        assert!(busy.detail.is_empty());
         assert_eq!(peer.threads_started(), held);
         assert_eq!(peer.live_workers.load(Ordering::Acquire), 1);
         assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
@@ -1819,28 +1711,21 @@ mod tests {
         });
         third_rx.recv_timeout(Duration::from_secs(2)).unwrap();
         let before_wedge = peer.threads_started();
-        assert_eq!(
-            peer.snapshot_with(after + lease + lease, || panic!("third worker"))
-                .code,
-            SNAPSHOT_FAILED
-        );
+        let wedged = peer.snapshot_with(after + lease + lease, || panic!("third worker"));
+        assert_eq!(wedged.code, SNAPSHOT_FAILED);
+        assert_eq!(wedged.detail, A11Y_WEDGED);
         assert_eq!(peer.threads_started(), before_wedge);
         assert!(peer.live_workers.load(Ordering::Acquire) <= A11Y_THREAD_CAP);
         assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
-        assert_eq!(peer.restarts(), 1);
-        assert_eq!(peer.heal_count(), Some(1));
-        assert_eq!(
-            peer.snapshot_with(after + lease + lease, || panic!("cooldown restart"))
-                .code,
-            SNAPSHOT_FAILED
-        );
-        assert_eq!(peer.restarts(), 1);
-        assert_eq!(peer.heal_count(), Some(1));
-        assert_eq!(peer.threads_started(), before_wedge);
         release_again_tx.send(()).unwrap();
         release_third_tx.send(()).unwrap();
         let _ = again.join().unwrap();
         let _ = third.join().unwrap();
+        let after_release = peer.snapshot_with(after + lease + lease, || {
+            snapshot_from_jni(|| Ok(node_wire("AFTER", [7, 7, 8, 8])))
+        });
+        assert_eq!(after_release.code, OK);
+        assert!(after_release.detail.contains("AFTER"));
         assert!(peer.worker_peak() <= A11Y_THREAD_CAP);
     }
 

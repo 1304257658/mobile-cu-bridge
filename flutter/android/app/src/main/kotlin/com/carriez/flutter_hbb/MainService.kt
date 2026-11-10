@@ -101,16 +101,6 @@ class MainService : Service() {
     fun rustPeerApkCoverInstall(apkPath: String): String = peerApkCoverInstall(this, apkPath)
 
     @Keep
-    fun rustA11yRestart(): Boolean {
-        if (!scheduleA11yRestart(this)) {
-            Log.e(logTag, "a11y restart alarm refused")
-            return false
-        }
-        android.os.Process.killProcess(android.os.Process.myPid())
-        return true
-    }
-
-    @Keep
     fun rustSemanticAction(kind: String, arg: String): String {
         val svc = InputService.ctx ?: return when (kind) {
             "open_app" -> {
@@ -382,10 +372,6 @@ class MainService : Service() {
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
         Log.d("whichService", "this service: ${Thread.currentThread()}")
         super.onStartCommand(intent, flags, startId)
-        if (intent?.action == ACT_A11Y_RESTART) {
-            Log.d(logTag, "a11y restart, stored id unchanged, capture consent not reused")
-            return START_NOT_STICKY
-        }
         if (intent?.action == ACT_INIT_MEDIA_PROJECTION_AND_SERVICE) {
             if (intent.getBooleanExtra(EXT_INIT_FROM_BOOT, false)) {
                 FFI.startService()

@@ -310,6 +310,7 @@ impl Flight {
     fn finish_snapshot(&mut self, code: &str, detail: &str) {
         self.finish(code);
         if self.code != OK {
+            self.keep_wedged_detail(detail);
             return;
         }
         match crate::a11y_snapshot::accept_snapshot_detail(detail) {
@@ -329,9 +330,17 @@ impl Flight {
     pub fn detail(&self) -> &str {
         &self.detail
     }
+
+    fn keep_wedged_detail(&mut self, detail: &str) {
+        if self.code == SNAPSHOT_FAILED && detail == crate::a11y_snapshot::A11Y_WEDGED {
+            self.detail = crate::a11y_snapshot::A11Y_WEDGED.to_owned();
+        }
+    }
 }
 
-/// Record a peer completion. `list_apps` keeps its detail. Every other kind
+/// Record a peer completion. `list_apps` keeps its detail. A snapshot keeps a
+/// tree only on `ok`. `snapshot_failed` keeps detail only when it is exactly
+/// `a11y_wedged`, including a click that hit the same wedge. Every other kind
 /// stores only the code, so an `open_app` failure cannot be rewritten by a
 /// payload and is not collapsed into [`INJECT_FAILED`].
 pub fn store_peer_result(flight: &mut Flight, kind: &str, code: &str, detail: &str) {
@@ -339,6 +348,9 @@ pub fn store_peer_result(flight: &mut Flight, kind: &str, code: &str, detail: &s
         flight.finish_list(code, detail);
     } else if kind == SNAPSHOT {
         flight.finish_snapshot(code, detail);
+    } else if kind == CLICK {
+        flight.finish(code);
+        flight.keep_wedged_detail(detail);
     } else {
         flight.finish(code);
     }
@@ -1089,6 +1101,28 @@ mod tests {
         assert!(flight.detail().contains("\"nodes\":[]"));
         store_peer_result(&mut flight, SNAPSHOT, REF_STALE, page);
         assert_eq!(flight.result(), REF_STALE);
+        assert!(flight.detail().is_empty());
+        store_peer_result(&mut flight, SNAPSHOT, SNAPSHOT_FAILED, "busy");
+        assert_eq!(flight.result(), SNAPSHOT_FAILED);
+        assert!(flight.detail().is_empty());
+        store_peer_result(
+            &mut flight,
+            SNAPSHOT,
+            SNAPSHOT_FAILED,
+            crate::a11y_snapshot::A11Y_WEDGED,
+        );
+        assert_eq!(flight.result(), SNAPSHOT_FAILED);
+        assert_eq!(flight.detail(), crate::a11y_snapshot::A11Y_WEDGED);
+        store_peer_result(
+            &mut flight,
+            CLICK,
+            SNAPSHOT_FAILED,
+            crate::a11y_snapshot::A11Y_WEDGED,
+        );
+        assert_eq!(flight.result(), SNAPSHOT_FAILED);
+        assert_eq!(flight.detail(), crate::a11y_snapshot::A11Y_WEDGED);
+        store_peer_result(&mut flight, CLICK, SNAPSHOT_FAILED, "");
+        assert_eq!(flight.result(), SNAPSHOT_FAILED);
         assert!(flight.detail().is_empty());
         store_peer_result(
             &mut flight,
